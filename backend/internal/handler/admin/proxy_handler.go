@@ -2,14 +2,21 @@ package admin
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 )
 
 // ProxyHandler handles admin proxy management
@@ -43,6 +50,42 @@ type UpdateProxyRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	Status   string `json:"status" binding:"omitempty,oneof=active inactive"`
+}
+
+const proxySubscriptionMaxBytes = 2 << 20
+
+// ImportProxySubscriptionRequest imports supported HTTP/SOCKS nodes from a subscription.
+type ImportProxySubscriptionRequest struct {
+	URL        string `json:"url"`
+	Content    string `json:"content"`
+	NamePrefix string `json:"name_prefix"`
+}
+
+type importProxySubscriptionCandidate struct {
+	Name     string
+	Protocol string
+	Host     string
+	Port     int
+	Username string
+	Password string
+}
+
+type importProxySubscriptionParseResult struct {
+	Total       int
+	Parsed      []importProxySubscriptionCandidate
+	Unsupported int
+	Invalid     int
+}
+
+type importProxySubscriptionResult struct {
+	Total       int      `json:"total"`
+	Parsed      int      `json:"parsed"`
+	Created     int      `json:"created"`
+	Skipped     int      `json:"skipped"`
+	Unsupported int      `json:"unsupported"`
+	Invalid     int      `json:"invalid"`
+	Failed      int      `json:"failed"`
+	Errors      []string `json:"errors,omitempty"`
 }
 
 // List handles listing all proxies with pagination
@@ -366,4 +409,314 @@ func (h *ProxyHandler) BatchCreate(c *gin.Context) {
 		"created": created,
 		"skipped": skipped,
 	})
+}
+
+// ImportSubscription handles importing supported proxies from a Clash/Mihomo
+// subscription or a plain proxy URL list.
+// POST /api/v1/admin/proxies/import-subscription
+func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
+	var req ImportProxySubscriptionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	req.URL = strings.TrimSpace(req.URL)
+	req.Content = strings.TrimSpace(req.Content)
+	req.NamePrefix = strings.TrimSpace(req.NamePrefix)
+	if req.URL == "" && req.Content == "" {
+		response.BadRequest(c, "url or content is required")
+		return
+	}
+
+	executeAdminIdempotentJSON(c, "admin.proxies.import_subscription", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
+		content := req.Content
+		if content == "" {
+			fetched, err := fetchProxySubscription(ctx, req.URL)
+			if err != nil {
+				return nil, err
+			}
+			content = fetched
+		}
+
+		parsed, err := parseProxySubscription(content, req.NamePrefix)
+		if err != nil {
+			return nil, err
+		}
+
+		result := importProxySubscriptionResult{
+			Total:       parsed.Total,
+			Parsed:      len(parsed.Parsed),
+			Unsupported: parsed.Unsupported,
+			Invalid:     parsed.Invalid,
+		}
+
+		for _, item := range parsed.Parsed {
+			exists, err := h.adminService.CheckProxyExists(ctx, item.Host, item.Port, item.Username, item.Password)
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				result.Skipped++
+				continue
+			}
+			if _, err := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
+				Name:     item.Name,
+				Protocol: item.Protocol,
+				Host:     item.Host,
+				Port:     item.Port,
+				Username: item.Username,
+				Password: item.Password,
+			}); err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, item.Name+": "+err.Error())
+				continue
+			}
+			result.Created++
+		}
+
+		return result, nil
+	})
+}
+
+func fetchProxySubscription(ctx context.Context, rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", errors.New("invalid subscription URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", errors.New("subscription URL must use http or https")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "sub2api-proxy-subscription-import/1.0")
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", errors.New("subscription fetch failed: " + resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, proxySubscriptionMaxBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > proxySubscriptionMaxBytes {
+		return "", errors.New("subscription is too large")
+	}
+	return string(data), nil
+}
+
+func parseProxySubscription(content, namePrefix string) (importProxySubscriptionParseResult, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return importProxySubscriptionParseResult{}, errors.New("subscription content is empty")
+	}
+
+	if decoded, ok := decodeMaybeBase64Subscription(content); ok {
+		if result, err := parseProxySubscription(decoded, namePrefix); err == nil && result.Total > 0 {
+			return result, nil
+		}
+	}
+
+	if result, ok := parseMihomoProxySubscription(content, namePrefix); ok {
+		return result, nil
+	}
+
+	result := importProxySubscriptionParseResult{}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		result.Total++
+		item, ok := parseProxySubscriptionURL(line, namePrefix, result.Total)
+		if !ok {
+			result.Invalid++
+			continue
+		}
+		result.Parsed = append(result.Parsed, item)
+	}
+	if result.Total == 0 {
+		return result, errors.New("no proxy entries found")
+	}
+	return result, nil
+}
+
+func decodeMaybeBase64Subscription(content string) (string, bool) {
+	normalized := strings.TrimSpace(content)
+	if normalized == "" || strings.ContainsAny(normalized, "\n\r{}[]:") {
+		return "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(normalized)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(normalized)
+	}
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(normalized)
+	}
+	if err != nil {
+		return "", false
+	}
+	out := strings.TrimSpace(string(decoded))
+	return out, out != ""
+}
+
+func parseMihomoProxySubscription(content, namePrefix string) (importProxySubscriptionParseResult, bool) {
+	var doc struct {
+		Proxies []map[string]any `yaml:"proxies"`
+	}
+	if err := yaml.Unmarshal([]byte(content), &doc); err != nil || len(doc.Proxies) == 0 {
+		return importProxySubscriptionParseResult{}, false
+	}
+
+	result := importProxySubscriptionParseResult{Total: len(doc.Proxies)}
+	for i, raw := range doc.Proxies {
+		item, status := parseMihomoProxyNode(raw, namePrefix, i+1)
+		switch status {
+		case "parsed":
+			result.Parsed = append(result.Parsed, item)
+		case "unsupported":
+			result.Unsupported++
+		default:
+			result.Invalid++
+		}
+	}
+	return result, true
+}
+
+func parseMihomoProxyNode(raw map[string]any, namePrefix string, index int) (importProxySubscriptionCandidate, string) {
+	protocol := normalizeSubscriptionProxyProtocol(stringFromAny(raw["type"]))
+	if protocol == "" {
+		if strings.TrimSpace(stringFromAny(raw["type"])) == "" {
+			return importProxySubscriptionCandidate{}, "invalid"
+		}
+		return importProxySubscriptionCandidate{}, "unsupported"
+	}
+
+	host := strings.TrimSpace(stringFromAny(raw["server"]))
+	port := intFromAny(raw["port"])
+	if host == "" || port < 1 || port > 65535 {
+		return importProxySubscriptionCandidate{}, "invalid"
+	}
+
+	name := strings.TrimSpace(stringFromAny(raw["name"]))
+	if name == "" {
+		name = "subscription proxy " + strconv.Itoa(index)
+	}
+	return importProxySubscriptionCandidate{
+		Name:     buildSubscriptionProxyName(namePrefix, name),
+		Protocol: protocol,
+		Host:     host,
+		Port:     port,
+		Username: firstNonEmptyString(raw["username"], raw["user"]),
+		Password: firstNonEmptyString(raw["password"], raw["pass"]),
+	}, "parsed"
+}
+
+func parseProxySubscriptionURL(line, namePrefix string, index int) (importProxySubscriptionCandidate, bool) {
+	parsed, err := url.Parse(line)
+	if err != nil {
+		return importProxySubscriptionCandidate{}, false
+	}
+	protocol := normalizeSubscriptionProxyProtocol(parsed.Scheme)
+	if protocol == "" || parsed.Hostname() == "" {
+		return importProxySubscriptionCandidate{}, false
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return importProxySubscriptionCandidate{}, false
+	}
+	username := ""
+	password := ""
+	if parsed.User != nil {
+		username = parsed.User.Username()
+		password, _ = parsed.User.Password()
+	}
+	name := strings.TrimSpace(parsed.Fragment)
+	if name == "" {
+		name = "subscription proxy " + strconv.Itoa(index)
+	}
+	return importProxySubscriptionCandidate{
+		Name:     buildSubscriptionProxyName(namePrefix, name),
+		Protocol: protocol,
+		Host:     parsed.Hostname(),
+		Port:     port,
+		Username: username,
+		Password: password,
+	}, true
+}
+
+func normalizeSubscriptionProxyProtocol(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "http":
+		return "http"
+	case "https":
+		return "https"
+	case "socks", "socks5":
+		return "socks5"
+	case "socks5h":
+		return "socks5h"
+	default:
+		return ""
+	}
+}
+
+func buildSubscriptionProxyName(prefix, name string) string {
+	prefix = strings.TrimSpace(prefix)
+	name = strings.TrimSpace(name)
+	if prefix == "" {
+		return name
+	}
+	return prefix + " " + name
+}
+
+func firstNonEmptyString(values ...any) string {
+	for _, value := range values {
+		if out := strings.TrimSpace(stringFromAny(value)); out != "" {
+			return out
+		}
+	}
+	return ""
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+func intFromAny(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(v))
+		return n
+	default:
+		return 0
+	}
 }

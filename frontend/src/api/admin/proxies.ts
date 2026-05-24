@@ -8,6 +8,8 @@ import type {
   Proxy,
   ProxyAccountSummary,
   ProxyQualityCheckResult,
+  ProxySubscriptionImportRequest,
+  ProxySubscriptionImportResult,
   CreateProxyRequest,
   UpdateProxyRequest,
   PaginatedResponse,
@@ -212,6 +214,16 @@ export async function batchCreate(
   return data
 }
 
+export async function importSubscription(
+  payload: ProxySubscriptionImportRequest
+): Promise<ProxySubscriptionImportResult> {
+  const { data } = await apiClient.post<ProxySubscriptionImportResult>(
+    '/admin/proxies/import-subscription',
+    payload
+  )
+  return data
+}
+
 export async function batchDelete(ids: number[]): Promise<{
   deleted_ids: number[]
   skipped: Array<{ id: number; reason: string }>
@@ -269,6 +281,7 @@ export const proxiesAPI = {
   getStats,
   getProxyAccounts,
   batchCreate,
+  importSubscription,
   batchDelete,
   exportData,
   importData

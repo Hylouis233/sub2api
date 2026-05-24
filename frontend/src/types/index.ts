@@ -741,6 +741,23 @@ export interface ProxyQualityCheckResult {
   items: ProxyQualityCheckItem[]
 }
 
+export interface ProxySubscriptionImportRequest {
+  url?: string
+  content?: string
+  name_prefix?: string
+}
+
+export interface ProxySubscriptionImportResult {
+  total: number
+  parsed: number
+  created: number
+  skipped: number
+  unsupported: number
+  invalid: number
+  failed: number
+  errors?: string[]
+}
+
 // Gemini credentials structure for OAuth and API Key authentication
 export interface GeminiCredentials {
   // API Key authentication

@@ -76,6 +76,9 @@
             <button @click="showImportData = true" class="btn btn-secondary">
               {{ t('admin.proxies.dataImport') }}
             </button>
+            <button @click="showSubscriptionImport = true" class="btn btn-secondary">
+              {{ t('admin.proxies.subscriptionImport') }}
+            </button>
             <button @click="showExportDataDialog = true" class="btn btn-secondary">
               {{ selectedCount > 0 ? t('admin.proxies.dataExportSelected') : t('admin.proxies.dataExport') }}
             </button>
@@ -754,6 +757,72 @@
     />
 
     <BaseDialog
+      :show="showSubscriptionImport"
+      :title="t('admin.proxies.subscriptionImportTitle')"
+      width="normal"
+      @close="closeSubscriptionImport"
+    >
+      <form id="subscription-import-form" class="space-y-5" @submit.prevent="handleSubscriptionImport">
+        <div>
+          <label class="input-label">{{ t('admin.proxies.subscriptionUrl') }}</label>
+          <input
+            v-model="subscriptionImportForm.url"
+            type="url"
+            class="input"
+            :placeholder="t('admin.proxies.subscriptionUrlPlaceholder')"
+          />
+          <p class="input-hint mt-1">{{ t('admin.proxies.subscriptionUrlHint') }}</p>
+        </div>
+        <div>
+          <label class="input-label">{{ t('admin.proxies.subscriptionContent') }}</label>
+          <textarea
+            v-model="subscriptionImportForm.content"
+            rows="8"
+            class="input font-mono text-sm"
+            :placeholder="t('admin.proxies.subscriptionContentPlaceholder')"
+          ></textarea>
+          <p class="input-hint mt-1">{{ t('admin.proxies.subscriptionContentHint') }}</p>
+        </div>
+        <div>
+          <label class="input-label">{{ t('admin.proxies.subscriptionNamePrefix') }}</label>
+          <input
+            v-model="subscriptionImportForm.name_prefix"
+            type="text"
+            class="input"
+            :placeholder="t('admin.proxies.subscriptionNamePrefixPlaceholder')"
+          />
+        </div>
+        <div class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-200">
+          {{ t('admin.proxies.subscriptionSupportedHint') }}
+        </div>
+      </form>
+      <template #footer>
+        <div class="flex justify-end gap-3">
+          <button type="button" class="btn btn-secondary" @click="closeSubscriptionImport">
+            {{ t('common.cancel') }}
+          </button>
+          <button
+            type="submit"
+            form="subscription-import-form"
+            class="btn btn-primary"
+            :disabled="submitting || (!subscriptionImportForm.url.trim() && !subscriptionImportForm.content.trim())"
+          >
+            <svg
+              v-if="submitting"
+              class="-ml-1 mr-2 h-4 w-4 animate-spin"
+              fill="none"
+              viewBox="0 0 24 24"
+            >
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            {{ submitting ? t('admin.proxies.importing') : t('admin.proxies.subscriptionImportButton') }}
+          </button>
+        </div>
+      </template>
+    </BaseDialog>
+
+    <BaseDialog
       :show="showQualityReportDialog"
       :title="t('admin.proxies.qualityReportTitle')"
       width="normal"
@@ -971,6 +1040,7 @@ const showEditModal = ref(false)
 const editPasswordVisible = ref(false)
 const editPasswordDirty = ref(false)
 const showImportData = ref(false)
+const showSubscriptionImport = ref(false)
 const showDeleteDialog = ref(false)
 const showBatchDeleteDialog = ref(false)
 const showExportDataDialog = ref(false)
@@ -1027,6 +1097,12 @@ const batchParseResult = reactive({
     username: string
     password: string
   }>
+})
+
+const subscriptionImportForm = reactive({
+  url: '',
+  content: '',
+  name_prefix: ''
 })
 
 const createForm = reactive({
@@ -1160,6 +1236,47 @@ const closeCreateModal = () => {
 const handleDataImported = () => {
   showImportData.value = false
   loadProxies()
+}
+
+const closeSubscriptionImport = () => {
+  showSubscriptionImport.value = false
+  subscriptionImportForm.url = ''
+  subscriptionImportForm.content = ''
+  subscriptionImportForm.name_prefix = ''
+}
+
+const handleSubscriptionImport = async () => {
+  if (!subscriptionImportForm.url.trim() && !subscriptionImportForm.content.trim()) {
+    appStore.showError(t('admin.proxies.subscriptionImportRequired'))
+    return
+  }
+  submitting.value = true
+  try {
+    const result = await adminAPI.proxies.importSubscription({
+      url: subscriptionImportForm.url.trim() || undefined,
+      content: subscriptionImportForm.content.trim() || undefined,
+      name_prefix: subscriptionImportForm.name_prefix.trim() || undefined
+    })
+    const params = {
+      created: result.created,
+      skipped: result.skipped,
+      unsupported: result.unsupported,
+      invalid: result.invalid,
+      failed: result.failed
+    }
+    if (result.failed > 0 || result.invalid > 0) {
+      appStore.showWarning(t('admin.proxies.subscriptionImportPartial', params))
+    } else {
+      appStore.showSuccess(t('admin.proxies.subscriptionImportSuccess', params))
+    }
+    closeSubscriptionImport()
+    loadProxies()
+  } catch (error: any) {
+    appStore.showError(error.response?.data?.detail || t('admin.proxies.subscriptionImportFailed'))
+    console.error('Error importing proxy subscription:', error)
+  } finally {
+    submitting.value = false
+  }
 }
 
 // Parse proxy URL: protocol://user:pass@host:port or protocol://host:port
