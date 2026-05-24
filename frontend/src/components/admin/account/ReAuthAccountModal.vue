@@ -126,12 +126,20 @@
         :show-help="isAnthropic"
         :show-proxy-warning="isAnthropic"
         :show-cookie-option="isAnthropic"
+        :show-refresh-token-option="isOpenAI"
+        :show-mobile-refresh-token-option="isOpenAI"
+        :show-access-token-option="isOpenAI"
+        :show-codex-session-import-option="isOpenAI"
         :allow-multiple="false"
         :method-label="t('admin.accounts.inputMethod')"
         :platform="isOpenAI ? 'openai' : isGemini ? 'gemini' : isAntigravity ? 'antigravity' : 'anthropic'"
         :show-project-id="isGemini && geminiOAuthType === 'code_assist'"
         @generate-url="handleGenerateUrl"
         @cookie-auth="handleCookieAuth"
+        @validate-refresh-token="handleOpenAIValidateRefreshToken"
+        @validate-mobile-refresh-token="handleOpenAIValidateMobileRT"
+        @import-access-token="handleOpenAIImportAccessToken"
+        @import-codex-session="handleOpenAIImportCodexSession"
       />
 
     </div>
@@ -204,6 +212,9 @@ interface OAuthFlowExposed {
   oauthState: string
   projectId: string
   sessionKey: string
+  refreshToken: string
+  accessToken: string
+  codexSession: string
   inputMethod: AuthInputMethod
   reset: () => void
 }
@@ -270,8 +281,7 @@ const currentError = computed(() => {
 
 // Computed
 const isManualInputMethod = computed(() => {
-  // OpenAI/Gemini/Antigravity always use manual input (no cookie auth option)
-  return isOpenAILike.value || isGemini.value || isAntigravity.value || oauthFlowRef.value?.inputMethod === 'manual'
+  return (oauthFlowRef.value?.inputMethod || 'manual') === 'manual'
 })
 
 const canExchangeCode = computed(() => {
@@ -337,6 +347,128 @@ const handleGenerateUrl = async () => {
     await antigravityOAuth.generateAuthUrl(props.account.proxy_id)
   } else {
     await claudeOAuth.generateAuthUrl(addMethod.value, props.account.proxy_id)
+  }
+}
+
+const OPENAI_MOBILE_RT_CLIENT_ID = 'app_LlGpXReQgckcGGUo2JrYvtJK'
+
+const singleInputValue = (content: string, label: string) => {
+  const values = content
+    .split('\n')
+    .map((item) => item.trim())
+    .filter((item) => item)
+  if (values.length !== 1) {
+    openaiOAuth.error.value = t('admin.accounts.oauth.openai.singleReauthInputRequired', { label })
+    appStore.showError(openaiOAuth.error.value)
+    return ''
+  }
+  return values[0]
+}
+
+const singleCodexImportValue = (content: string) => {
+  const trimmed = content.trim()
+  if (!trimmed) return ''
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) return trimmed
+  return singleInputValue(trimmed, 'AT/Codex JSON')
+}
+
+const finishOpenAIReauthorization = async (
+  credentials: Record<string, unknown>,
+  extra?: Record<string, unknown>
+) => {
+  if (!props.account) return
+  await adminAPI.accounts.update(props.account.id, {
+    type: 'oauth',
+    credentials,
+    extra
+  })
+  const updatedAccount = await adminAPI.accounts.clearError(props.account.id)
+  appStore.showSuccess(t('admin.accounts.reAuthorizedSuccess'))
+  emit('reauthorized', updatedAccount)
+  handleClose()
+}
+
+const handleOpenAIValidateRefreshToken = async (refreshToken: string) => {
+  await handleOpenAIRefreshTokenReauth(refreshToken)
+}
+
+const handleOpenAIValidateMobileRT = async (refreshToken: string) => {
+  await handleOpenAIRefreshTokenReauth(refreshToken, OPENAI_MOBILE_RT_CLIENT_ID)
+}
+
+const handleOpenAIRefreshTokenReauth = async (refreshToken: string, clientId?: string) => {
+  if (!props.account || !isOpenAILike.value) return
+  const value = singleInputValue(refreshToken, 'RT')
+  if (!value) return
+
+  const tokenInfo = await openaiOAuth.validateRefreshToken(value, props.account.proxy_id, clientId)
+  if (!tokenInfo) return
+
+  try {
+    await finishOpenAIReauthorization(
+      openaiOAuth.buildCredentials(tokenInfo),
+      openaiOAuth.buildExtraInfo(tokenInfo)
+    )
+  } catch (error: any) {
+    openaiOAuth.error.value = error.response?.data?.detail || t('admin.accounts.oauth.authFailed')
+    appStore.showError(openaiOAuth.error.value)
+  }
+}
+
+const handleOpenAIImportAccessToken = async (content: string) => {
+  const value = singleInputValue(content, 'AT')
+  if (!value) return
+  await handleOpenAIImportCodexSession(value)
+}
+
+const formatCodexImportMessages = (messages?: Array<{ index: number; name?: string; message: string }>) => {
+  return (messages || [])
+    .map((item) => {
+      const name = item.name ? ` ${item.name}` : ''
+      return `#${item.index}${name}: ${item.message}`
+    })
+    .join('\n')
+}
+
+const handleOpenAIImportCodexSession = async (content: string) => {
+  if (!props.account || !isOpenAILike.value) return
+  const value = singleCodexImportValue(content)
+  if (!value) return
+
+  openaiOAuth.loading.value = true
+  openaiOAuth.error.value = ''
+  try {
+    const result = await adminAPI.accounts.importCodexSession({
+      content: value,
+      name: props.account.name,
+      proxy_id: props.account.proxy_id,
+      target_account_id: props.account.id,
+      update_existing: true
+    })
+
+    if (result.updated > 0 && result.failed === 0) {
+      const updatedAccount = await adminAPI.accounts.clearError(props.account.id)
+      appStore.showSuccess(t('admin.accounts.reAuthorizedSuccess'))
+      emit('reauthorized', updatedAccount)
+      handleClose()
+      return
+    }
+
+    const errorText = formatCodexImportMessages(result.errors)
+    const warningText = formatCodexImportMessages(result.warnings)
+    openaiOAuth.error.value =
+      [errorText, warningText].filter(Boolean).join('\n') ||
+      t('admin.accounts.oauth.openai.codexSessionImportFailed')
+    appStore.showError(openaiOAuth.error.value)
+  } catch (error: any) {
+    openaiOAuth.error.value =
+      error.response?.data?.detail ||
+      error.response?.data?.message ||
+      error.message ||
+      t('admin.accounts.oauth.openai.codexSessionImportFailed')
+    appStore.showError(openaiOAuth.error.value)
+  } finally {
+    openaiOAuth.loading.value = false
   }
 }
 

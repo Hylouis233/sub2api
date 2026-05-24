@@ -37,6 +37,7 @@ type CodexSessionImportRequest struct {
 	CredentialExtras        map[string]any `json:"credential_extras"`
 	Extra                   map[string]any `json:"extra"`
 	UpdateExisting          *bool          `json:"update_existing"`
+	TargetAccountID         *int64         `json:"target_account_id"`
 	SkipDefaultGroupBind    *bool          `json:"skip_default_group_bind"`
 	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"`
 }
@@ -141,6 +142,10 @@ func (h *AccountHandler) ImportCodexSession(c *gin.Context) {
 		response.BadRequest(c, "请输入 accessToken 或 Codex session JSON")
 		return
 	}
+	if req.TargetAccountID != nil && len(entries) != 1 {
+		response.BadRequest(c, "target_account_id only supports a single Codex session or accessToken")
+		return
+	}
 
 	executeAdminIdempotentJSON(c, "admin.accounts.import_codex_session", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
 		return h.importCodexSessions(ctx, req, entries)
@@ -158,6 +163,16 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 		return result, err
 	}
 	index := buildCodexAccountIndex(existingAccounts)
+	var targetAccount *service.Account
+	if req.TargetAccountID != nil {
+		targetAccount, err = h.adminService.GetAccount(ctx, *req.TargetAccountID)
+		if err != nil {
+			return result, err
+		}
+		if targetAccount == nil || targetAccount.Platform != service.PlatformOpenAI || targetAccount.Type != service.AccountTypeOAuth {
+			return result, errors.New("target_account_id must reference an OpenAI OAuth account")
+		}
+	}
 
 	updateExisting := true
 	if req.UpdateExisting != nil {
@@ -223,6 +238,62 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 				Name:    accountName,
 				Message: warning,
 			})
+		}
+
+		if targetAccount != nil {
+			mergedCredentials := mergeCodexImportCredentials(targetAccount.Credentials, credentials, item)
+			mergedExtra := mergeCodexImportMap(targetAccount.Extra, extra)
+			updateInput := &service.UpdateAccountInput{
+				Credentials:        mergedCredentials,
+				Extra:              mergedExtra,
+				Concurrency:        req.Concurrency,
+				Priority:           req.Priority,
+				RateMultiplier:     req.RateMultiplier,
+				LoadFactor:         req.LoadFactor,
+				ExpiresAt:          effectiveExpiresAt,
+				AutoPauseOnExpired: autoPauseOnExpired,
+			}
+			if req.ProxyID != nil {
+				updateInput.ProxyID = req.ProxyID
+			}
+			if len(req.GroupIDs) > 0 {
+				groupIDs := append([]int64(nil), req.GroupIDs...)
+				updateInput.GroupIDs = &groupIDs
+				updateInput.SkipMixedChannelCheck = skipMixedChannelCheck
+			}
+			updated, updateErr := h.adminService.UpdateAccount(ctx, targetAccount.ID, updateInput)
+			if updateErr != nil {
+				result.Failed++
+				result.Items = append(result.Items, CodexSessionImportItem{
+					Index:   entry.Index,
+					Name:    targetAccount.Name,
+					Action:  "failed",
+					Message: updateErr.Error(),
+				})
+				result.Errors = append(result.Errors, CodexSessionImportMessage{
+					Index:   entry.Index,
+					Name:    targetAccount.Name,
+					Message: updateErr.Error(),
+				})
+				continue
+			}
+			if h.tokenCacheInvalidator != nil && updated != nil {
+				_ = h.tokenCacheInvalidator.InvalidateToken(ctx, updated)
+			}
+			result.Updated++
+			accountID := targetAccount.ID
+			if updated != nil {
+				accountID = updated.ID
+				targetAccount = updated
+				index.Add(*updated)
+			}
+			result.Items = append(result.Items, CodexSessionImportItem{
+				Index:     entry.Index,
+				Name:      targetAccount.Name,
+				Action:    "updated",
+				AccountID: accountID,
+			})
+			continue
 		}
 
 		if duplicateIndex, ok := firstSeenCodexIdentity(seenIdentity, item.IdentityKeys); ok {

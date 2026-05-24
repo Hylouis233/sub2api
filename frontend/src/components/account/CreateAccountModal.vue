@@ -2789,7 +2789,7 @@
         :show-refresh-token-option="form.platform === 'openai' || form.platform === 'antigravity'"
         :show-mobile-refresh-token-option="form.platform === 'openai'"
         :show-session-token-option="false"
-        :show-access-token-option="false"
+        :show-access-token-option="form.platform === 'openai'"
         :show-codex-session-import-option="form.platform === 'openai'"
         :platform="form.platform"
         :show-project-id="geminiOAuthType === 'code_assist'"
@@ -2798,6 +2798,7 @@
         @validate-refresh-token="handleValidateRefreshToken"
         @validate-mobile-refresh-token="handleOpenAIValidateMobileRT"
         @validate-session-token="handleValidateSessionToken"
+        @import-access-token="handleOpenAIImportCodexSession"
         @import-codex-session="handleOpenAIImportCodexSession"
       />
 

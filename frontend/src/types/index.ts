@@ -741,6 +741,23 @@ export interface ProxyQualityCheckResult {
   items: ProxyQualityCheckItem[]
 }
 
+export interface ProxySubscriptionImportRequest {
+  url?: string
+  content?: string
+  name_prefix?: string
+}
+
+export interface ProxySubscriptionImportResult {
+  total: number
+  parsed: number
+  created: number
+  skipped: number
+  unsupported: number
+  invalid: number
+  failed: number
+  errors?: string[]
+}
+
 // Gemini credentials structure for OAuth and API Key authentication
 export interface GeminiCredentials {
   // API Key authentication
@@ -1133,6 +1150,7 @@ export interface CodexSessionImportRequest {
   credential_extras?: Record<string, unknown>
   extra?: Record<string, unknown>
   update_existing?: boolean
+  target_account_id?: number
   skip_default_group_bind?: boolean
   confirm_mixed_channel_risk?: boolean
 }

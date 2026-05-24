@@ -1,0 +1,78 @@
+package admin
+
+import "testing"
+
+func TestParseProxySubscriptionSupportsMihomoHTTPAndSOCKS(t *testing.T) {
+	content := `
+proxies:
+  - name: http-node
+    type: http
+    server: proxy.example.com
+    port: 8080
+    username: user
+    password: pass
+  - name: socks-node
+    type: socks5
+    server: socks.example.com
+    port: 1080
+  - name: ss-node
+    type: ss
+    server: ss.example.com
+    port: 8388
+`
+
+	result, err := parseProxySubscription(content, "sub")
+	if err != nil {
+		t.Fatalf("parseProxySubscription error = %v", err)
+	}
+	if result.Total != 3 {
+		t.Fatalf("total = %d, want 3", result.Total)
+	}
+	if len(result.Parsed) != 2 {
+		t.Fatalf("parsed = %d, want 2", len(result.Parsed))
+	}
+	if result.Unsupported != 1 {
+		t.Fatalf("unsupported = %d, want 1", result.Unsupported)
+	}
+
+	first := result.Parsed[0]
+	if first.Name != "sub http-node" || first.Protocol != "http" || first.Host != "proxy.example.com" || first.Port != 8080 {
+		t.Fatalf("first proxy = %+v", first)
+	}
+	if first.Username != "user" || first.Password != "pass" {
+		t.Fatalf("auth = %q/%q, want user/pass", first.Username, first.Password)
+	}
+
+	second := result.Parsed[1]
+	if second.Protocol != "socks5" || second.Host != "socks.example.com" || second.Port != 1080 {
+		t.Fatalf("second proxy = %+v", second)
+	}
+}
+
+func TestParseProxySubscriptionSupportsPlainProxyURLList(t *testing.T) {
+	content := `
+http://user:pass@proxy.example.com:8080#primary
+socks5h://socks.example.com:1080
+not a proxy
+`
+
+	result, err := parseProxySubscription(content, "")
+	if err != nil {
+		t.Fatalf("parseProxySubscription error = %v", err)
+	}
+	if result.Total != 3 {
+		t.Fatalf("total = %d, want 3", result.Total)
+	}
+	if len(result.Parsed) != 2 {
+		t.Fatalf("parsed = %d, want 2", len(result.Parsed))
+	}
+	if result.Invalid != 1 {
+		t.Fatalf("invalid = %d, want 1", result.Invalid)
+	}
+	if result.Parsed[0].Name != "primary" {
+		t.Fatalf("name = %q, want primary", result.Parsed[0].Name)
+	}
+	if result.Parsed[1].Protocol != "socks5h" {
+		t.Fatalf("protocol = %q, want socks5h", result.Parsed[1].Protocol)
+	}
+}
