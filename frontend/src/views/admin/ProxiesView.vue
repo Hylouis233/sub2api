@@ -795,10 +795,10 @@
         <div>
           <label class="input-label">{{ t('admin.proxies.subscriptionQualityPolicy') }}</label>
           <select v-model="subscriptionImportForm.quality_policy" class="input">
+            <option value="none">{{ t('admin.proxies.subscriptionQualityNone') }}</option>
             <option value="disable_d">{{ t('admin.proxies.subscriptionQualityDisableD') }}</option>
             <option value="disable_c_or_below">{{ t('admin.proxies.subscriptionQualityDisableCOrBelow') }}</option>
             <option value="disable_b_or_below">{{ t('admin.proxies.subscriptionQualityDisableBOrBelow') }}</option>
-            <option value="none">{{ t('admin.proxies.subscriptionQualityNone') }}</option>
           </select>
           <p class="input-hint mt-1">{{ t('admin.proxies.subscriptionQualityPolicyHint') }}</p>
         </div>
@@ -1113,7 +1113,7 @@ const subscriptionImportForm = reactive({
   url: '',
   content: '',
   name_prefix: '',
-  quality_policy: 'disable_d' as 'none' | 'disable_d' | 'disable_c_or_below' | 'disable_b_or_below'
+  quality_policy: 'none' as 'none' | 'disable_d' | 'disable_c_or_below' | 'disable_b_or_below'
 })
 
 const createForm = reactive({
@@ -1254,7 +1254,7 @@ const closeSubscriptionImport = () => {
   subscriptionImportForm.url = ''
   subscriptionImportForm.content = ''
   subscriptionImportForm.name_prefix = ''
-  subscriptionImportForm.quality_policy = 'disable_d'
+  subscriptionImportForm.quality_policy = 'none'
 }
 
 const handleSubscriptionImport = async () => {

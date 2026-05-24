@@ -527,8 +527,8 @@ func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
 
 func normalizeSubscriptionQualityPolicy(value string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "default", proxySubscriptionQualityPolicyDisableD:
-		return proxySubscriptionQualityPolicyDisableD, nil
+	case "", "default":
+		return proxySubscriptionQualityPolicyNone, nil
 	case proxySubscriptionQualityPolicyNone:
 		return proxySubscriptionQualityPolicyNone, nil
 	case proxySubscriptionQualityPolicyDisableCOrBelow:
@@ -599,7 +599,7 @@ func fetchProxySubscription(ctx context.Context, rawURL string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", errors.New("subscription fetch failed: " + resp.Status)
