@@ -563,6 +563,9 @@ func decodeMaybeBase64Subscription(content string) (string, bool) {
 		decoded, err = base64.URLEncoding.DecodeString(normalized)
 	}
 	if err != nil {
+		decoded, err = base64.RawURLEncoding.DecodeString(normalized)
+	}
+	if err != nil {
 		return "", false
 	}
 	out := strings.TrimSpace(string(decoded))

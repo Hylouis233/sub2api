@@ -4021,7 +4021,7 @@ export default {
       dataImportErrors: 'Failure Details',
       dataImportSuccess: 'Import completed: created {proxy_created}, reused {proxy_reused}',
       dataImportCompletedWithErrors: 'Import completed with errors: failed {proxy_failed}',
-      subscriptionImport: 'Subscription',
+      subscriptionImport: 'Import Subscription',
       subscriptionImportTitle: 'Import Proxy Subscription',
       subscriptionUrl: 'Subscription URL',
       subscriptionUrlPlaceholder: 'https://example.com/sub?target=mihomo',
