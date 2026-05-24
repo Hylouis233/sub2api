@@ -3312,9 +3312,34 @@ export default {
         disableScheduling: '批量停止调度',
         resetStatus: '批量重置状态',
         refreshToken: '批量刷新令牌',
+        testConnection: '批量测试连接',
         resetStatusSuccess: '已成功重置 {count} 个账号状态',
         refreshTokenSuccess: '已成功刷新 {count} 个账号令牌',
         partialSuccess: '操作部分完成：{success} 成功，{failed} 失败'
+      },
+      bulkTest: {
+        title: '批量测试连接',
+        selected: '已选择 {count} 个账号',
+        noPlatformSummary: '未加载账号平台信息',
+        loadingModels: '加载模型中...',
+        modelPlaceholder: '选择或输入测试模型',
+        useModel: '使用模型',
+        testing: '测试中...',
+        successCount: '成功 {count}',
+        failedCount: '失败 {count}',
+        columns: {
+          account: '账号',
+          type: '类型',
+          status: '状态',
+          latency: '耗时',
+          message: '结果'
+        },
+        status: {
+          pending: '待测试',
+          testing: '测试中',
+          success: '成功',
+          failed: '失败'
+        }
       },
       bulkEdit: {
         title: '批量编辑账号',

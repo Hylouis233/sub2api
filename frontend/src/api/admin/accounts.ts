@@ -194,6 +194,55 @@ export async function testAccount(id: number): Promise<{
   return data
 }
 
+export interface BatchAccountTestItem {
+  account_id: number
+  name?: string
+  platform?: string
+  type?: string
+  success: boolean
+  status: string
+  response_text?: string
+  error?: string
+  latency_ms?: number
+}
+
+export interface BatchAccountTestResult {
+  total: number
+  success: number
+  failed: number
+  items: BatchAccountTestItem[]
+}
+
+/**
+ * Test selected account connections with a user-selected model.
+ * @param accountIds - Account IDs to test
+ * @param modelId - Model ID to send in the probe
+ * @param options - Optional prompt/mode overrides
+ * @returns Batch connection test summary
+ */
+export async function batchTest(
+  accountIds: number[],
+  modelId: string,
+  options?: {
+    prompt?: string
+    mode?: string
+  }
+): Promise<BatchAccountTestResult> {
+  const { data } = await apiClient.post<BatchAccountTestResult>(
+    '/admin/accounts/batch-test',
+    {
+      account_ids: accountIds,
+      model_id: modelId,
+      prompt: options?.prompt ?? '',
+      mode: options?.mode ?? ''
+    },
+    {
+      timeout: 300000
+    }
+  )
+  return data
+}
+
 /**
  * Refresh account credentials
  * @param id - Account ID
@@ -664,6 +713,7 @@ export const accountsAPI = {
   delete: deleteAccount,
   toggleStatus,
   testAccount,
+  batchTest,
   refreshCredentials,
   getStats,
   clearError,

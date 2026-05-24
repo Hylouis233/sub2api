@@ -122,6 +122,7 @@ describe('admin AccountsView bulk edit scope', () => {
           ImportDataModal: true,
           ReAuthAccountModal: true,
           AccountTestModal: true,
+          BatchAccountTestModal: true,
           AccountStatsModal: true,
           ScheduledTestsPanel: true,
           SyncFromCrsModal: true,

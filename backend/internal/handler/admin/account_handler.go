@@ -703,6 +703,35 @@ type TestAccountRequest struct {
 	Mode    string `json:"mode"`
 }
 
+// BatchTestAccountsRequest represents the request body for batch account tests.
+type BatchTestAccountsRequest struct {
+	AccountIDs []int64 `json:"account_ids"`
+	ModelID    string  `json:"model_id"`
+	Prompt     string  `json:"prompt"`
+	Mode       string  `json:"mode"`
+}
+
+// BatchTestAccountItem represents one account test result in a batch.
+type BatchTestAccountItem struct {
+	AccountID    int64  `json:"account_id"`
+	Name         string `json:"name,omitempty"`
+	Platform     string `json:"platform,omitempty"`
+	Type         string `json:"type,omitempty"`
+	Success      bool   `json:"success"`
+	Status       string `json:"status"`
+	ResponseText string `json:"response_text,omitempty"`
+	Error        string `json:"error,omitempty"`
+	LatencyMs    int64  `json:"latency_ms"`
+}
+
+// BatchTestAccountsResponse is the summary returned by batch account tests.
+type BatchTestAccountsResponse struct {
+	Total   int                    `json:"total"`
+	Success int                    `json:"success"`
+	Failed  int                    `json:"failed"`
+	Items   []BatchTestAccountItem `json:"items"`
+}
+
 type SyncFromCRSRequest struct {
 	BaseURL            string   `json:"base_url" binding:"required"`
 	Username           string   `json:"username" binding:"required"`
@@ -741,6 +770,124 @@ func (h *AccountHandler) Test(c *gin.Context) {
 			_ = c.Error(err)
 		}
 	}
+}
+
+// BatchTest handles testing selected accounts with a user-selected model.
+// POST /api/v1/admin/accounts/batch-test
+func (h *AccountHandler) BatchTest(c *gin.Context) {
+	var req BatchTestAccountsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	if len(req.AccountIDs) == 0 {
+		response.BadRequest(c, "account_ids is required")
+		return
+	}
+	modelID := strings.TrimSpace(req.ModelID)
+	if modelID == "" {
+		response.BadRequest(c, "model_id is required")
+		return
+	}
+	if h.accountTestService == nil {
+		response.Error(c, http.StatusServiceUnavailable, "Account test service unavailable")
+		return
+	}
+
+	ctx := c.Request.Context()
+	accounts, err := h.adminService.GetAccountsByIDs(ctx, req.AccountIDs)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	accountByID := make(map[int64]*service.Account, len(accounts))
+	for _, account := range accounts {
+		if account != nil {
+			accountByID[account.ID] = account
+		}
+	}
+
+	items := make([]BatchTestAccountItem, len(req.AccountIDs))
+	const maxConcurrency = 5
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxConcurrency)
+
+	for i, id := range req.AccountIDs {
+		account := accountByID[id]
+		if account == nil {
+			items[i] = BatchTestAccountItem{
+				AccountID: id,
+				Success:   false,
+				Status:    "failed",
+				Error:     "account not found",
+			}
+			continue
+		}
+
+		items[i] = BatchTestAccountItem{
+			AccountID: account.ID,
+			Name:      account.Name,
+			Platform:  account.Platform,
+			Type:      account.Type,
+			Status:    "pending",
+		}
+		index := i
+		accountID := account.ID
+		g.Go(func() error {
+			testResult, testErr := h.accountTestService.RunTestBackgroundWithOptions(
+				gctx,
+				accountID,
+				modelID,
+				req.Prompt,
+				req.Mode,
+			)
+
+			item := items[index]
+			item.Status = "failed"
+			if testResult != nil {
+				item.Status = testResult.Status
+				item.ResponseText = testResult.ResponseText
+				item.Error = testResult.ErrorMessage
+				item.LatencyMs = testResult.LatencyMs
+			}
+			if testErr != nil && item.Error == "" {
+				item.Error = testErr.Error()
+			}
+			item.Success = item.Status == "success" && item.Error == ""
+
+			if item.Success && h.rateLimitService != nil {
+				if _, recoverErr := h.rateLimitService.RecoverAccountAfterSuccessfulTest(gctx, accountID); recoverErr != nil {
+					log.Printf("[WARN] Failed to recover account state after batch test for account %d: %v", accountID, recoverErr)
+				}
+			}
+
+			items[index] = item
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	successCount := 0
+	failedCount := 0
+	for _, item := range items {
+		if item.Success {
+			successCount++
+		} else {
+			failedCount++
+		}
+	}
+
+	response.Success(c, BatchTestAccountsResponse{
+		Total:   len(items),
+		Success: successCount,
+		Failed:  failedCount,
+		Items:   items,
+	})
 }
 
 // RecoverState handles unified recovery of recoverable account runtime state.

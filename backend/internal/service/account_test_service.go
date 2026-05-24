@@ -1678,13 +1678,19 @@ func (s *AccountTestService) sendErrorAndEnd(c *gin.Context, errorMsg string) er
 // RunTestBackground executes an account test in-memory (no real HTTP client),
 // capturing SSE output via httptest.NewRecorder, then parses the result.
 func (s *AccountTestService) RunTestBackground(ctx context.Context, accountID int64, modelID string) (*ScheduledTestResult, error) {
+	return s.RunTestBackgroundWithOptions(ctx, accountID, modelID, "", AccountTestModeDefault)
+}
+
+// RunTestBackgroundWithOptions executes an account test in-memory with the same
+// options accepted by the interactive SSE test endpoint.
+func (s *AccountTestService) RunTestBackgroundWithOptions(ctx context.Context, accountID int64, modelID string, prompt string, mode string) (*ScheduledTestResult, error) {
 	startedAt := time.Now()
 
 	w := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(w)
 	ginCtx.Request = (&http.Request{}).WithContext(ctx)
 
-	testErr := s.TestAccountConnection(ginCtx, accountID, modelID, "", AccountTestModeDefault)
+	testErr := s.TestAccountConnection(ginCtx, accountID, modelID, prompt, mode)
 
 	finishedAt := time.Now()
 	body := w.Body.String()

@@ -3165,9 +3165,34 @@ export default {
         disableScheduling: 'Disable Scheduling',
         resetStatus: 'Reset Status',
         refreshToken: 'Refresh Token',
+        testConnection: 'Test Connections',
         resetStatusSuccess: 'Successfully reset {count} account(s) status',
         refreshTokenSuccess: 'Successfully refreshed {count} account(s) token',
         partialSuccess: 'Partially completed: {success} succeeded, {failed} failed'
+      },
+      bulkTest: {
+        title: 'Batch Test Connections',
+        selected: '{count} account(s) selected',
+        noPlatformSummary: 'Account platform info not loaded',
+        loadingModels: 'Loading models...',
+        modelPlaceholder: 'Select or enter a test model',
+        useModel: 'Use model',
+        testing: 'Testing...',
+        successCount: '{count} succeeded',
+        failedCount: '{count} failed',
+        columns: {
+          account: 'Account',
+          type: 'Type',
+          status: 'Status',
+          latency: 'Latency',
+          message: 'Result'
+        },
+        status: {
+          pending: 'Pending',
+          testing: 'Testing',
+          success: 'Success',
+          failed: 'Failed'
+        }
       },
       bulkEdit: {
         title: 'Bulk Edit Accounts',
