@@ -58,13 +58,19 @@ const (
 	proxySubscriptionMaxBytes        = 2 << 20
 	proxySubscriptionRequestMaxBytes = proxySubscriptionMaxBytes + (64 << 10)
 	proxySubscriptionMaxBase64Depth  = 2
+
+	proxySubscriptionQualityPolicyNone            = "none"
+	proxySubscriptionQualityPolicyDisableD        = "disable_d"
+	proxySubscriptionQualityPolicyDisableCOrBelow = "disable_c_or_below"
+	proxySubscriptionQualityPolicyDisableBOrBelow = "disable_b_or_below"
 )
 
 // ImportProxySubscriptionRequest imports supported HTTP/SOCKS nodes from a subscription.
 type ImportProxySubscriptionRequest struct {
-	URL        string `json:"url"`
-	Content    string `json:"content"`
-	NamePrefix string `json:"name_prefix"`
+	URL           string `json:"url"`
+	Content       string `json:"content"`
+	NamePrefix    string `json:"name_prefix"`
+	QualityPolicy string `json:"quality_policy"`
 }
 
 type importProxySubscriptionCandidate struct {
@@ -84,14 +90,17 @@ type importProxySubscriptionParseResult struct {
 }
 
 type importProxySubscriptionResult struct {
-	Total       int      `json:"total"`
-	Parsed      int      `json:"parsed"`
-	Created     int      `json:"created"`
-	Skipped     int      `json:"skipped"`
-	Unsupported int      `json:"unsupported"`
-	Invalid     int      `json:"invalid"`
-	Failed      int      `json:"failed"`
-	Errors      []string `json:"errors,omitempty"`
+	Total           int      `json:"total"`
+	Parsed          int      `json:"parsed"`
+	Created         int      `json:"created"`
+	Skipped         int      `json:"skipped"`
+	Unsupported     int      `json:"unsupported"`
+	Invalid         int      `json:"invalid"`
+	Failed          int      `json:"failed"`
+	QualityChecked  int      `json:"quality_checked"`
+	QualityDisabled int      `json:"quality_disabled"`
+	QualityFailed   int      `json:"quality_failed"`
+	Errors          []string `json:"errors,omitempty"`
 }
 
 // List handles listing all proxies with pagination
@@ -431,6 +440,12 @@ func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
 	req.URL = strings.TrimSpace(req.URL)
 	req.Content = strings.TrimSpace(req.Content)
 	req.NamePrefix = strings.TrimSpace(req.NamePrefix)
+	qualityPolicy, err := normalizeSubscriptionQualityPolicy(req.QualityPolicy)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	req.QualityPolicy = qualityPolicy
 	if req.URL == "" && req.Content == "" {
 		response.BadRequest(c, "url or content is required")
 		return
@@ -471,23 +486,100 @@ func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
 				result.Skipped++
 				continue
 			}
-			if _, err := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
+			createdProxy, err := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
 				Name:     item.Name,
 				Protocol: item.Protocol,
 				Host:     item.Host,
 				Port:     item.Port,
 				Username: item.Username,
 				Password: item.Password,
-			}); err != nil {
+			})
+			if err != nil {
 				result.Failed++
 				result.Errors = append(result.Errors, item.Name+": "+err.Error())
 				continue
 			}
 			result.Created++
+
+			if qualityPolicy == proxySubscriptionQualityPolicyNone {
+				continue
+			}
+			quality, err := h.adminService.CheckProxyQuality(ctx, createdProxy.ID)
+			if err != nil {
+				result.QualityFailed++
+				result.Errors = append(result.Errors, item.Name+" quality check: "+err.Error())
+				continue
+			}
+			result.QualityChecked++
+			if shouldDisableProxyForSubscriptionQuality(qualityPolicy, quality.Grade) {
+				if _, err := h.adminService.UpdateProxy(ctx, createdProxy.ID, &service.UpdateProxyInput{Status: service.StatusDisabled}); err != nil {
+					result.QualityFailed++
+					result.Errors = append(result.Errors, item.Name+" disable: "+err.Error())
+					continue
+				}
+				result.QualityDisabled++
+			}
 		}
 
 		return result, nil
 	})
+}
+
+func normalizeSubscriptionQualityPolicy(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "default", proxySubscriptionQualityPolicyDisableD:
+		return proxySubscriptionQualityPolicyDisableD, nil
+	case proxySubscriptionQualityPolicyNone:
+		return proxySubscriptionQualityPolicyNone, nil
+	case proxySubscriptionQualityPolicyDisableCOrBelow:
+		return proxySubscriptionQualityPolicyDisableCOrBelow, nil
+	case proxySubscriptionQualityPolicyDisableBOrBelow:
+		return proxySubscriptionQualityPolicyDisableBOrBelow, nil
+	default:
+		return "", errors.New("invalid quality_policy")
+	}
+}
+
+func shouldDisableProxyForSubscriptionQuality(policy, grade string) bool {
+	if policy == proxySubscriptionQualityPolicyNone {
+		return false
+	}
+	rank, ok := proxySubscriptionQualityGradeRank(grade)
+	if !ok {
+		return true
+	}
+	switch policy {
+	case proxySubscriptionQualityPolicyDisableBOrBelow:
+		return rank <= proxySubscriptionQualityGradeRankValue("B")
+	case proxySubscriptionQualityPolicyDisableCOrBelow:
+		return rank <= proxySubscriptionQualityGradeRankValue("C")
+	case proxySubscriptionQualityPolicyDisableD:
+		return rank <= proxySubscriptionQualityGradeRankValue("D")
+	default:
+		return true
+	}
+}
+
+func proxySubscriptionQualityGradeRank(grade string) (int, bool) {
+	switch strings.ToUpper(strings.TrimSpace(grade)) {
+	case "A":
+		return 4, true
+	case "B":
+		return 3, true
+	case "C":
+		return 2, true
+	case "D":
+		return 1, true
+	case "F":
+		return 0, true
+	default:
+		return -1, false
+	}
+}
+
+func proxySubscriptionQualityGradeRankValue(grade string) int {
+	rank, _ := proxySubscriptionQualityGradeRank(grade)
+	return rank
 }
 
 func fetchProxySubscription(ctx context.Context, rawURL string) (string, error) {
