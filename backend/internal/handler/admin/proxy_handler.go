@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -52,7 +54,11 @@ type UpdateProxyRequest struct {
 	Status   string `json:"status" binding:"omitempty,oneof=active inactive"`
 }
 
-const proxySubscriptionMaxBytes = 2 << 20
+const (
+	proxySubscriptionMaxBytes        = 2 << 20
+	proxySubscriptionRequestMaxBytes = proxySubscriptionMaxBytes + (64 << 10)
+	proxySubscriptionMaxBase64Depth  = 2
+)
 
 // ImportProxySubscriptionRequest imports supported HTTP/SOCKS nodes from a subscription.
 type ImportProxySubscriptionRequest struct {
@@ -415,6 +421,7 @@ func (h *ProxyHandler) BatchCreate(c *gin.Context) {
 // subscription or a plain proxy URL list.
 // POST /api/v1/admin/proxies/import-subscription
 func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, proxySubscriptionRequestMaxBytes)
 	var req ImportProxySubscriptionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid request: "+err.Error())
@@ -426,6 +433,10 @@ func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
 	req.NamePrefix = strings.TrimSpace(req.NamePrefix)
 	if req.URL == "" && req.Content == "" {
 		response.BadRequest(c, "url or content is required")
+		return
+	}
+	if len(req.Content) > proxySubscriptionMaxBytes {
+		response.BadRequest(c, "subscription content is too large")
 		return
 	}
 
@@ -480,21 +491,18 @@ func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
 }
 
 func fetchProxySubscription(ctx context.Context, rawURL string) (string, error) {
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", errors.New("invalid subscription URL")
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", errors.New("subscription URL must use http or https")
+	parsed, err := validateSubscriptionFetchURL(ctx, rawURL)
+	if err != nil {
+		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("User-Agent", "sub2api-proxy-subscription-import/1.0")
 
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := newSubscriptionFetchHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -514,16 +522,124 @@ func fetchProxySubscription(ctx context.Context, rawURL string) (string, error) 
 	return string(data), nil
 }
 
-func parseProxySubscription(content, namePrefix string) (importProxySubscriptionParseResult, error) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return importProxySubscriptionParseResult{}, errors.New("subscription content is empty")
+func validateSubscriptionFetchURL(ctx context.Context, rawURL string) (*url.URL, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return nil, errors.New("invalid subscription URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, errors.New("subscription URL must use http or https")
+	}
+	if _, err := lookupSubscriptionHostIPs(ctx, parsed.Hostname()); err != nil {
+		return nil, err
+	}
+	return parsed, nil
+}
+
+func newSubscriptionFetchHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+
+			ips, err := lookupSubscriptionHostIPs(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			ip := chooseSubscriptionDialIP(network, ips)
+			if ip == nil {
+				return nil, errors.New("subscription URL host has no address for requested network")
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		},
 	}
 
-	if decoded, ok := decodeMaybeBase64Subscription(content); ok {
-		if result, err := parseProxySubscription(decoded, namePrefix); err == nil && result.Total > 0 {
-			return result, nil
+	return &http.Client{
+		Timeout:   20 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("subscription URL redirects too many times")
+			}
+			_, err := validateSubscriptionFetchURL(req.Context(), req.URL.String())
+			return err
+		},
+	}
+}
+
+func lookupSubscriptionHostIPs(ctx context.Context, host string) ([]net.IP, error) {
+	host = strings.TrimSpace(host)
+	if host == "" || strings.Contains(host, "%") {
+		return nil, errors.New("subscription URL host is not allowed")
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		if !isPublicSubscriptionIP(ip) {
+			return nil, errors.New("subscription URL host resolves to a private address")
 		}
+		return []net.IP{ip}, nil
+	}
+
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, errors.New("subscription URL host has no addresses")
+	}
+
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		if !isPublicSubscriptionIP(addr.IP) {
+			return nil, errors.New("subscription URL host resolves to a private address")
+		}
+		ips = append(ips, addr.IP)
+	}
+	return ips, nil
+}
+
+func chooseSubscriptionDialIP(network string, ips []net.IP) net.IP {
+	for _, ip := range ips {
+		switch network {
+		case "tcp4":
+			if ip.To4() != nil {
+				return ip
+			}
+		case "tcp6":
+			if ip.To4() == nil {
+				return ip
+			}
+		default:
+			return ip
+		}
+	}
+	return nil
+}
+
+func isPublicSubscriptionIP(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	return addr.IsGlobalUnicast() &&
+		!addr.IsPrivate() &&
+		!addr.IsLoopback() &&
+		!addr.IsLinkLocalUnicast() &&
+		!addr.IsLinkLocalMulticast() &&
+		!addr.IsUnspecified()
+}
+
+func parseProxySubscription(content, namePrefix string) (importProxySubscriptionParseResult, error) {
+	content, err := decodeProxySubscriptionContent(content)
+	if err != nil {
+		return importProxySubscriptionParseResult{}, err
+	}
+	if content == "" {
+		return importProxySubscriptionParseResult{}, errors.New("subscription content is empty")
 	}
 
 	if result, ok := parseMihomoProxySubscription(content, namePrefix); ok {
@@ -550,10 +666,39 @@ func parseProxySubscription(content, namePrefix string) (importProxySubscription
 	return result, nil
 }
 
-func decodeMaybeBase64Subscription(content string) (string, bool) {
+func decodeProxySubscriptionContent(content string) (string, error) {
+	normalized := strings.TrimSpace(content)
+	if len(normalized) > proxySubscriptionMaxBytes {
+		return "", errors.New("subscription content is too large")
+	}
+	for depth := 0; depth < proxySubscriptionMaxBase64Depth; depth++ {
+		decoded, ok, err := decodeMaybeBase64SubscriptionOnce(normalized)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return normalized, nil
+		}
+		normalized = strings.TrimSpace(decoded)
+		if normalized == "" {
+			return "", errors.New("subscription content is empty")
+		}
+		if len(normalized) > proxySubscriptionMaxBytes {
+			return "", errors.New("subscription content is too large")
+		}
+	}
+	if _, ok, err := decodeMaybeBase64SubscriptionOnce(normalized); err != nil {
+		return "", err
+	} else if ok {
+		return "", errors.New("subscription base64 nesting is too deep")
+	}
+	return normalized, nil
+}
+
+func decodeMaybeBase64SubscriptionOnce(content string) (string, bool, error) {
 	normalized := strings.TrimSpace(content)
 	if normalized == "" || strings.ContainsAny(normalized, "\n\r{}[]:") {
-		return "", false
+		return "", false, nil
 	}
 	decoded, err := base64.StdEncoding.DecodeString(normalized)
 	if err != nil {
@@ -566,10 +711,13 @@ func decodeMaybeBase64Subscription(content string) (string, bool) {
 		decoded, err = base64.RawURLEncoding.DecodeString(normalized)
 	}
 	if err != nil {
-		return "", false
+		return "", false, nil
+	}
+	if len(decoded) > proxySubscriptionMaxBytes {
+		return "", false, errors.New("subscription content is too large")
 	}
 	out := strings.TrimSpace(string(decoded))
-	return out, out != ""
+	return out, out != "", nil
 }
 
 func parseMihomoProxySubscription(content, namePrefix string) (importProxySubscriptionParseResult, bool) {

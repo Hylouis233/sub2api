@@ -1,6 +1,10 @@
 package admin
 
-import "testing"
+import (
+	"encoding/base64"
+	"strings"
+	"testing"
+)
 
 func TestParseProxySubscriptionSupportsMihomoHTTPAndSOCKS(t *testing.T) {
 	content := `
@@ -74,5 +78,45 @@ not a proxy
 	}
 	if result.Parsed[1].Protocol != "socks5h" {
 		t.Fatalf("protocol = %q, want socks5h", result.Parsed[1].Protocol)
+	}
+}
+
+func TestParseProxySubscriptionSupportsURLSafeUnpaddedBase64(t *testing.T) {
+	content := base64.RawURLEncoding.EncodeToString([]byte("http://user:pass@proxy.example.com:8080#primary"))
+
+	result, err := parseProxySubscription(content, "")
+	if err != nil {
+		t.Fatalf("parseProxySubscription error = %v", err)
+	}
+	if len(result.Parsed) != 1 {
+		t.Fatalf("parsed = %d, want 1", len(result.Parsed))
+	}
+	if result.Parsed[0].Name != "primary" || result.Parsed[0].Protocol != "http" {
+		t.Fatalf("proxy = %+v", result.Parsed[0])
+	}
+}
+
+func TestParseProxySubscriptionRejectsTooDeepBase64(t *testing.T) {
+	content := "http://proxy.example.com:8080#primary"
+	for i := 0; i < proxySubscriptionMaxBase64Depth+1; i++ {
+		content = base64.RawURLEncoding.EncodeToString([]byte(content))
+	}
+
+	_, err := parseProxySubscription(content, "")
+	if err == nil || !strings.Contains(err.Error(), "base64 nesting is too deep") {
+		t.Fatalf("error = %v, want nesting error", err)
+	}
+}
+
+func TestParseProxySubscriptionRejectsOversizedContent(t *testing.T) {
+	_, err := parseProxySubscription(strings.Repeat("x", proxySubscriptionMaxBytes+1), "")
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("error = %v, want too large", err)
+	}
+}
+
+func TestSubscriptionFetchURLRejectsPrivateAddress(t *testing.T) {
+	if _, err := validateSubscriptionFetchURL(t.Context(), "http://127.0.0.1/sub.yaml"); err == nil {
+		t.Fatal("expected private address error")
 	}
 }
