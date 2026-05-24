@@ -120,3 +120,39 @@ func TestSubscriptionFetchURLRejectsPrivateAddress(t *testing.T) {
 		t.Fatal("expected private address error")
 	}
 }
+
+func TestSubscriptionQualityPolicyDefaultsToDisableD(t *testing.T) {
+	policy, err := normalizeSubscriptionQualityPolicy("")
+	if err != nil {
+		t.Fatalf("normalizeSubscriptionQualityPolicy error = %v", err)
+	}
+	if policy != proxySubscriptionQualityPolicyDisableD {
+		t.Fatalf("policy = %q, want %q", policy, proxySubscriptionQualityPolicyDisableD)
+	}
+	if shouldDisableProxyForSubscriptionQuality(policy, "C") {
+		t.Fatal("C should stay enabled by default")
+	}
+	if !shouldDisableProxyForSubscriptionQuality(policy, "D") || !shouldDisableProxyForSubscriptionQuality(policy, "F") {
+		t.Fatal("D/F should be disabled by default")
+	}
+}
+
+func TestSubscriptionQualityPolicyThresholds(t *testing.T) {
+	tests := []struct {
+		policy string
+		grade  string
+		want   bool
+	}{
+		{proxySubscriptionQualityPolicyDisableCOrBelow, "B", false},
+		{proxySubscriptionQualityPolicyDisableCOrBelow, "C", true},
+		{proxySubscriptionQualityPolicyDisableBOrBelow, "A", false},
+		{proxySubscriptionQualityPolicyDisableBOrBelow, "B", true},
+		{proxySubscriptionQualityPolicyNone, "F", false},
+		{proxySubscriptionQualityPolicyDisableD, "", true},
+	}
+	for _, tt := range tests {
+		if got := shouldDisableProxyForSubscriptionQuality(tt.policy, tt.grade); got != tt.want {
+			t.Fatalf("shouldDisableProxyForSubscriptionQuality(%q, %q) = %v, want %v", tt.policy, tt.grade, got, tt.want)
+		}
+	}
+}

@@ -741,10 +741,13 @@ export interface ProxyQualityCheckResult {
   items: ProxyQualityCheckItem[]
 }
 
+export type ProxySubscriptionQualityPolicy = 'none' | 'disable_d' | 'disable_c_or_below' | 'disable_b_or_below'
+
 export interface ProxySubscriptionImportRequest {
   url?: string
   content?: string
   name_prefix?: string
+  quality_policy?: ProxySubscriptionQualityPolicy
 }
 
 export interface ProxySubscriptionImportResult {
@@ -755,6 +758,9 @@ export interface ProxySubscriptionImportResult {
   unsupported: number
   invalid: number
   failed: number
+  quality_checked: number
+  quality_disabled: number
+  quality_failed: number
   errors?: string[]
 }
 

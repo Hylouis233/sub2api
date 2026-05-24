@@ -792,6 +792,16 @@
             :placeholder="t('admin.proxies.subscriptionNamePrefixPlaceholder')"
           />
         </div>
+        <div>
+          <label class="input-label">{{ t('admin.proxies.subscriptionQualityPolicy') }}</label>
+          <select v-model="subscriptionImportForm.quality_policy" class="input">
+            <option value="disable_d">{{ t('admin.proxies.subscriptionQualityDisableD') }}</option>
+            <option value="disable_c_or_below">{{ t('admin.proxies.subscriptionQualityDisableCOrBelow') }}</option>
+            <option value="disable_b_or_below">{{ t('admin.proxies.subscriptionQualityDisableBOrBelow') }}</option>
+            <option value="none">{{ t('admin.proxies.subscriptionQualityNone') }}</option>
+          </select>
+          <p class="input-hint mt-1">{{ t('admin.proxies.subscriptionQualityPolicyHint') }}</p>
+        </div>
         <div class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-200">
           {{ t('admin.proxies.subscriptionSupportedHint') }}
         </div>
@@ -1102,7 +1112,8 @@ const batchParseResult = reactive({
 const subscriptionImportForm = reactive({
   url: '',
   content: '',
-  name_prefix: ''
+  name_prefix: '',
+  quality_policy: 'disable_d' as 'none' | 'disable_d' | 'disable_c_or_below' | 'disable_b_or_below'
 })
 
 const createForm = reactive({
@@ -1243,6 +1254,7 @@ const closeSubscriptionImport = () => {
   subscriptionImportForm.url = ''
   subscriptionImportForm.content = ''
   subscriptionImportForm.name_prefix = ''
+  subscriptionImportForm.quality_policy = 'disable_d'
 }
 
 const handleSubscriptionImport = async () => {
@@ -1255,16 +1267,20 @@ const handleSubscriptionImport = async () => {
     const result = await adminAPI.proxies.importSubscription({
       url: subscriptionImportForm.url.trim() || undefined,
       content: subscriptionImportForm.content.trim() || undefined,
-      name_prefix: subscriptionImportForm.name_prefix.trim() || undefined
+      name_prefix: subscriptionImportForm.name_prefix.trim() || undefined,
+      quality_policy: subscriptionImportForm.quality_policy
     })
     const params = {
       created: result.created,
       skipped: result.skipped,
       unsupported: result.unsupported,
       invalid: result.invalid,
-      failed: result.failed
+      failed: result.failed,
+      quality_checked: result.quality_checked,
+      quality_disabled: result.quality_disabled,
+      quality_failed: result.quality_failed
     }
-    if (result.failed > 0 || result.invalid > 0) {
+    if (result.failed > 0 || result.invalid > 0 || result.quality_failed > 0) {
       appStore.showWarning(t('admin.proxies.subscriptionImportPartial', params))
     } else {
       appStore.showSuccess(t('admin.proxies.subscriptionImportSuccess', params))
