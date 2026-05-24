@@ -3164,10 +3164,10 @@ export default {
         enableScheduling: 'Enable Scheduling',
         disableScheduling: 'Disable Scheduling',
         resetStatus: 'Reset Status',
-        refreshToken: 'Refresh Token',
+        refreshToken: 'Re-login',
         testConnection: 'Test Connections',
         resetStatusSuccess: 'Successfully reset {count} account(s) status',
-        refreshTokenSuccess: 'Successfully refreshed {count} account(s) token',
+        refreshTokenSuccess: 'Successfully re-logged {count} account(s)',
         partialSuccess: 'Partially completed: {success} succeeded, {failed} failed'
       },
       bulkTest: {

@@ -270,6 +270,81 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	return accessToken, nil
 }
 
+// RefreshAccessTokenNow forces a refresh-token exchange for an OpenAI OAuth
+// account. This is intentionally stricter than RefreshAccountToken: a missing
+// refresh_token is an error because callers use this after an upstream 401 to
+// prove whether the account can recover.
+func (p *OpenAITokenProvider) RefreshAccessTokenNow(ctx context.Context, account *Account) (*Account, error) {
+	p.ensureMetrics()
+	if account == nil {
+		return nil, errors.New("account is nil")
+	}
+	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
+		return nil, errors.New("not an openai oauth account")
+	}
+	if strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
+		return nil, errors.New("refresh_token is missing")
+	}
+
+	p.metrics.refreshRequests.Add(1)
+	p.metrics.touchNow()
+	cacheKey := OpenAITokenCacheKey(account)
+	if p.tokenCache != nil {
+		if err := p.tokenCache.DeleteAccessToken(ctx, cacheKey); err != nil {
+			slog.Warn("openai_token_cache_delete_before_force_refresh_failed", "account_id", account.ID, "error", err)
+		}
+	}
+
+	var refreshed *Account
+	var err error
+	if p.refreshAPI != nil && p.executor != nil {
+		var result *OAuthRefreshResult
+		result, err = p.refreshAPI.RefreshNow(ctx, account, p.executor)
+		if err == nil && result != nil {
+			if result.LockHeld {
+				err = errors.New("refresh lock held")
+			} else {
+				refreshed = result.Account
+			}
+		}
+	} else {
+		refreshed, err = p.refreshAccessTokenNowLegacy(ctx, account)
+	}
+	if err != nil {
+		p.metrics.refreshFailure.Add(1)
+		return nil, err
+	}
+	if refreshed == nil {
+		refreshed = account
+	}
+
+	p.metrics.refreshSuccess.Add(1)
+	if p.tokenCache != nil {
+		if err := p.tokenCache.DeleteAccessToken(ctx, cacheKey); err != nil {
+			slog.Warn("openai_token_cache_delete_after_force_refresh_failed", "account_id", account.ID, "error", err)
+		}
+	}
+	return refreshed, nil
+}
+
+func (p *OpenAITokenProvider) refreshAccessTokenNowLegacy(ctx context.Context, account *Account) (*Account, error) {
+	if p.openAIOAuthService == nil {
+		return nil, errors.New("openai oauth service not configured")
+	}
+	tokenInfo, err := p.openAIOAuthService.RefreshAccountToken(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+	newCredentials := p.openAIOAuthService.BuildAccountCredentials(tokenInfo)
+	newCredentials = MergeCredentials(account.Credentials, newCredentials)
+	newCredentials["_token_version"] = time.Now().UnixMilli()
+	if err := persistAccountCredentials(ctx, p.accountRepo, account, newCredentials); err != nil {
+		return nil, err
+	}
+	account.Credentials = newCredentials
+	return account, nil
+}
+
 // disableAccountMissingRefreshToken 在请求路径上发现 OpenAI OAuth 账号
 // 凭证已过期且 refresh_token 缺失时，将账号标记为 error 状态。
 // 这是一种永久性故障：仅靠后续请求或 TokenRefreshService 不会自愈

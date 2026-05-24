@@ -2,7 +2,10 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -35,6 +38,11 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	stateCtx, cancel := openAIAccountStateContext(ctx)
 	defer cancel()
 
+	if statusCode == http.StatusUnauthorized {
+		if handled, shouldDisable := s.handleOpenAIOAuth401Refresh(stateCtx, account, responseBody); handled {
+			return shouldDisable
+		}
+	}
 	if statusCode == http.StatusTooManyRequests {
 		s.markOpenAIOAuth429RateLimited(stateCtx, account, headers, responseBody)
 	}
@@ -46,6 +54,84 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 		s.BlockAccountScheduling(account, time.Time{}, "upstream_disable")
 	}
 	return shouldDisable
+}
+
+func (s *OpenAIGatewayService) handleOpenAIOAuth401Refresh(ctx context.Context, account *Account, responseBody []byte) (bool, bool) {
+	if s == nil || !isOpenAIOAuthAccount(account) || s.openAITokenProvider == nil {
+		return false, false
+	}
+	if strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
+		return false, false
+	}
+
+	refreshed, err := s.openAITokenProvider.RefreshAccessTokenNow(ctx, account)
+	if err == nil {
+		if refreshed != nil {
+			account.Credentials = refreshed.Credentials
+		}
+		if s.rateLimitService != nil {
+			if _, recoverErr := s.rateLimitService.RecoverAccountState(ctx, account.ID, AccountRecoveryOptions{}); recoverErr != nil {
+				slog.Warn("openai_oauth_401_recover_state_after_refresh_failed", "account_id", account.ID, "error", recoverErr)
+			}
+		}
+		s.ClearAccountSchedulingBlock(account.ID)
+		slog.Info("openai_oauth_401_refresh_succeeded", "account_id", account.ID)
+		return true, false
+	}
+
+	if isNonRetryableRefreshError(err) {
+		slog.Warn("openai_oauth_401_refresh_confirmed_invalid", "account_id", account.ID, "error", err)
+		return false, false
+	}
+
+	s.markOpenAIOAuth401RefreshPending(ctx, account, responseBody, err)
+	return true, true
+}
+
+func (s *OpenAIGatewayService) markOpenAIOAuth401RefreshPending(ctx context.Context, account *Account, responseBody []byte, refreshErr error) {
+	if s == nil || account == nil {
+		return
+	}
+	if s.rateLimitService != nil && s.rateLimitService.tokenCacheInvalidator != nil {
+		if err := s.rateLimitService.tokenCacheInvalidator.InvalidateToken(ctx, account); err != nil {
+			slog.Warn("openai_oauth_401_pending_invalidate_cache_failed", "account_id", account.ID, "error", err)
+		}
+	}
+	if account.Credentials == nil {
+		account.Credentials = make(map[string]any)
+	}
+	account.Credentials["expires_at"] = time.Now().Format(time.RFC3339)
+	if s.accountRepo != nil {
+		if err := persistAccountCredentials(ctx, s.accountRepo, account, account.Credentials); err != nil {
+			slog.Warn("openai_oauth_401_pending_force_refresh_update_failed", "account_id", account.ID, "error", err)
+		}
+	}
+
+	cooldownMinutes := 10
+	if s.cfg != nil && s.cfg.RateLimit.OAuth401CooldownMinutes > 0 {
+		cooldownMinutes = s.cfg.RateLimit.OAuth401CooldownMinutes
+	}
+	until := time.Now().Add(time.Duration(cooldownMinutes) * time.Minute)
+
+	upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(responseBody))
+	upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
+	if upstreamMsg != "" {
+		upstreamMsg = truncateForLog([]byte(upstreamMsg), 512)
+	}
+	reason := fmt.Sprintf("OAuth 401 refresh pending: refresh attempt failed temporarily: %v", refreshErr)
+	if upstreamMsg != "" {
+		reason = fmt.Sprintf("OAuth 401 refresh pending: %s; refresh attempt failed temporarily: %v", upstreamMsg, refreshErr)
+	}
+
+	if s.rateLimitService != nil {
+		s.rateLimitService.notifyAccountSchedulingBlocked(account, until, "oauth_401_refresh_pending")
+	}
+	s.BlockAccountScheduling(account, until, "oauth_401_refresh_pending")
+	if s.accountRepo != nil {
+		if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
+			slog.Warn("openai_oauth_401_pending_set_temp_unschedulable_failed", "account_id", account.ID, "error", err)
+		}
+	}
 }
 
 func (s *OpenAIGatewayService) markOpenAIOAuth429RateLimited(ctx context.Context, account *Account, headers http.Header, responseBody []byte) {

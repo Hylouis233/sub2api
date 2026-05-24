@@ -27,6 +27,50 @@ func TestOpenAI429FastPath_MarksOAuthAccountCoolingDown(t *testing.T) {
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(apiKeyAccount))
 }
 
+func TestOpenAI401FastPath_RefreshesBeforePermanentMark(t *testing.T) {
+	account := Account{
+		ID:       142,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Status:   StatusActive,
+		Credentials: map[string]any{
+			"access_token":  "old-access-token",
+			"refresh_token": "old-refresh-token",
+			"expires_at":    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+	repo := &accountTestOpenAI401Repo{account: account}
+	oauthClient := &accountTestOpenAIOAuthClient{}
+	oauthService := NewOpenAIOAuthService(nil, oauthClient)
+	provider := NewOpenAITokenProvider(repo, nil, oauthService)
+	rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	svc := &OpenAIGatewayService{
+		accountRepo:           repo,
+		openAITokenProvider:   provider,
+		rateLimitService:      rateLimitService,
+		cfg:                   &config.Config{},
+		openaiAccountStats:    nil,
+		openaiWSPool:          nil,
+		openaiScheduler:       nil,
+		openaiWSResolver:      nil,
+		codexSnapshotThrottle: nil,
+	}
+
+	shouldDisable := svc.handleOpenAIAccountUpstreamError(
+		context.Background(),
+		&account,
+		http.StatusUnauthorized,
+		http.Header{},
+		[]byte(`{"error":{"code":"token_invalidated","message":"old access token invalidated"}}`),
+	)
+
+	require.False(t, shouldDisable)
+	require.Equal(t, 1, oauthClient.refreshCalls)
+	require.Equal(t, 1, repo.updateCalls)
+	require.Equal(t, 0, repo.setErrorCalls)
+	require.Equal(t, "new-access-token", repo.account.GetOpenAIAccessToken())
+}
+
 func TestOpenAIRuntimeBlock_AppliesToOpenAIAPIKeyWhenRateLimitServiceStopsScheduling(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	account := &Account{ID: 44, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}

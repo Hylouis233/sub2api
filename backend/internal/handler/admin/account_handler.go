@@ -1087,6 +1087,15 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 		}
 	}
 
+	// 批量/单个重登成功后，认为 401/error/temp-unsched 等可恢复状态已被验证恢复。
+	if h.rateLimitService != nil {
+		if _, recoverErr := h.rateLimitService.RecoverAccountState(ctx, account.ID, service.AccountRecoveryOptions{}); recoverErr != nil {
+			log.Printf("[WARN] Failed to recover account state after refresh for account %d: %v", account.ID, recoverErr)
+		} else if recoveredAccount, getErr := h.adminService.GetAccount(ctx, account.ID); getErr == nil {
+			updatedAccount = recoveredAccount
+		}
+	}
+
 	// OpenAI OAuth: 刷新成功后检查并设置 privacy_mode
 	h.adminService.EnsureOpenAIPrivacy(ctx, updatedAccount)
 	// Antigravity OAuth: 刷新成功后检查并设置 privacy_mode
