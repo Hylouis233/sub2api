@@ -43,6 +43,26 @@ func IsImageGenerationIntent(endpoint string, requestedModel string, body []byte
 	return openAIJSONToolChoiceSelectsImageGeneration(gjson.GetBytes(body, "tool_choice"))
 }
 
+// IsOpenAIImageGenerationHardIntent is stricter than IsImageGenerationIntent:
+// it only treats explicit image endpoints, image models, or explicit tool_choice
+// selection as image-generation intent. Merely carrying an image_generation
+// tool in the tools array is treated as capability, not intent.
+func IsOpenAIImageGenerationHardIntent(endpoint string, requestedModel string, body []byte) bool {
+	if IsImageGenerationEndpoint(endpoint) {
+		return true
+	}
+	if isOpenAIImageGenerationModel(requestedModel) {
+		return true
+	}
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	if model := strings.TrimSpace(gjson.GetBytes(body, "model").String()); isOpenAIImageGenerationModel(model) {
+		return true
+	}
+	return openAIJSONToolChoiceSelectsImageGeneration(gjson.GetBytes(body, "tool_choice"))
+}
+
 // IsImageGenerationIntentMap is the map-backed variant used after service-side request mutation.
 func IsImageGenerationIntentMap(endpoint string, requestedModel string, reqBody map[string]any) bool {
 	if IsImageGenerationEndpoint(endpoint) {
@@ -58,6 +78,24 @@ func IsImageGenerationIntentMap(endpoint string, requestedModel string, reqBody 
 		return true
 	}
 	if hasOpenAIImageGenerationTool(reqBody) {
+		return true
+	}
+	return openAIAnyToolChoiceSelectsImageGeneration(reqBody["tool_choice"])
+}
+
+// IsOpenAIImageGenerationHardIntentMap is the map-backed variant of
+// IsOpenAIImageGenerationHardIntent.
+func IsOpenAIImageGenerationHardIntentMap(endpoint string, requestedModel string, reqBody map[string]any) bool {
+	if IsImageGenerationEndpoint(endpoint) {
+		return true
+	}
+	if isOpenAIImageGenerationModel(requestedModel) {
+		return true
+	}
+	if reqBody == nil {
+		return false
+	}
+	if isOpenAIImageGenerationModel(firstNonEmptyString(reqBody["model"])) {
 		return true
 	}
 	return openAIAnyToolChoiceSelectsImageGeneration(reqBody["tool_choice"])

@@ -118,18 +118,18 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 	}
 	value, ok := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
 	if !ok {
-		return false
+		return s.isOpenAIProxyRuntimeBlocked(account)
 	}
 	cooldownUntil, ok := value.(time.Time)
 	if !ok || cooldownUntil.IsZero() {
 		s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
-		return false
+		return s.isOpenAIProxyRuntimeBlocked(account)
 	}
 	if time.Now().Before(cooldownUntil) {
 		return true
 	}
 	s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
-	return false
+	return s.isOpenAIProxyRuntimeBlocked(account)
 }
 
 func (s *OpenAIGatewayService) recordOpenAIOAuth429() {

@@ -387,6 +387,9 @@ gateway:
   # Allow failover on selected 400 errors (default: off)
   # 允许在特定 400 错误时进行故障转移（默认：关闭）
   failover_on_400: false
+  # Max account switches before returning an upstream failure.
+  # 上游失败后最多切换账号次数；OpenAI 账号默认 2 次，避免错误长时间冒泡到网关外层。
+  max_account_switches: 2
   # Scheduling configuration
   # 调度配置
   scheduling:

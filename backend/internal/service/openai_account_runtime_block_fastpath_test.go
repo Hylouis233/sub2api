@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -80,6 +81,79 @@ func TestOpenAIRuntimeBlock_ClearAccountSchedulingBlock(t *testing.T) {
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 
 	svc.ClearAccountSchedulingBlock(account.ID)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAIRuntimeBlock_AppliesProxyRuntimeBlockWithoutAccountBlock(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	proxyID := int64(101)
+	account := &Account{
+		ID:       48,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17802},
+	}
+
+	svc.blockOpenAIProxyRuntime("proxy_id:101", time.Now().Add(time.Minute))
+
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAIRuntimeBlock_ClearsExpiredAccountBlockButKeepsProxyBlock(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	proxyID := int64(102)
+	account := &Account{
+		ID:       49,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17804},
+	}
+
+	svc.openaiAccountRuntimeBlockUntil.Store(account.ID, time.Now().Add(-time.Minute))
+	svc.blockOpenAIProxyRuntime("proxy_id:102", time.Now().Add(time.Minute))
+
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	_, accountBlockStillStored := svc.openaiAccountRuntimeBlockUntil.Load(account.ID)
+	require.False(t, accountBlockStillStored)
+}
+
+func TestOpenAIUpstreamNetworkFailuresBlockAccountAndProxyAfterTwoFailures(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	proxyID := int64(103)
+	account := &Account{
+		ID:       50,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17815},
+	}
+	err := errors.New(`Get "https://api.openai.com/v1/models": EOF`)
+
+	svc.recordOpenAIUpstreamRequestFailure(context.Background(), account, "socks5://host.docker.internal:17815", err)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+
+	svc.recordOpenAIUpstreamRequestFailure(context.Background(), account, "socks5://host.docker.internal:17815", err)
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAIUpstreamNetworkSuccessClearsConsecutiveFailureCounters(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	proxyID := int64(104)
+	account := &Account{
+		ID:       51,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17814},
+	}
+	err := errors.New(`Get "https://api.openai.com/v1/responses": EOF`)
+
+	svc.recordOpenAIUpstreamRequestFailure(context.Background(), account, "", err)
+	svc.recordOpenAIUpstreamRequestSuccess(account)
+	svc.recordOpenAIUpstreamRequestFailure(context.Background(), account, "", err)
+
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 

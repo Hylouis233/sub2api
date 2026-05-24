@@ -356,6 +356,9 @@ type OpenAIGatewayService struct {
 
 	openaiWSFallbackUntil               sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
+	openaiAccountNetworkFailureCounts   sync.Map // key: int64(accountID), value: *openAIConsecutiveFailureCounter
+	openaiProxyNetworkFailureCounts     sync.Map // key: string(proxy key), value: *openAIConsecutiveFailureCounter
+	openaiProxyRuntimeBlockUntil        sync.Map // key: string(proxy key), value: time.Time
 	openaiOAuth429WindowStartUnixNano   atomic.Int64
 	openaiOAuth429WindowCount           atomic.Int64
 	openaiWSRetryMetrics                openAIWSRetryMetrics
@@ -1937,6 +1940,9 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDB(ctx context.Co
 		if !isOpenAIAccountEligibleForRequest(account, requestedModel, requireCompact) {
 			return nil
 		}
+		if s.isOpenAIAccountRuntimeBlocked(account) {
+			return nil
+		}
 		return account
 	}
 
@@ -2158,7 +2164,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		imageGenerationAllowed = GroupAllowsImageGeneration(apiKey.Group)
 	}
 	codexImageGenerationBridgeEnabled := isCodexCLI && imageGenerationAllowed && s.isCodexImageGenerationBridgeEnabled(ctx, account, apiKey)
-	if IsImageGenerationIntentMap(openAIResponsesEndpoint, reqModel, reqBody) && !imageGenerationAllowed {
+	if IsOpenAIImageGenerationHardIntentMap(openAIResponsesEndpoint, reqModel, reqBody) && !imageGenerationAllowed {
 		setOpsUpstreamError(c, http.StatusForbidden, ImageGenerationPermissionMessage(), "")
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": gin.H{
@@ -2487,7 +2493,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 	}
 
-	if IsImageGenerationIntentMap(openAIResponsesEndpoint, reqModel, reqBody) && !imageGenerationAllowed {
+	if IsOpenAIImageGenerationHardIntentMap(openAIResponsesEndpoint, reqModel, reqBody) && !imageGenerationAllowed {
 		setOpsUpstreamError(c, http.StatusForbidden, ImageGenerationPermissionMessage(), "")
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": gin.H{
@@ -2496,6 +2502,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			},
 		})
 		return nil, errors.New("image generation disabled for group")
+	}
+	if !imageGenerationAllowed && removeOpenAIImageGenerationTools(reqBody) {
+		bodyModified = true
+		disablePatch()
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Removed passive /responses image_generation tool for image-disabled group")
 	}
 	imageBillingModel := ""
 	imageSizeTier := ""
@@ -2758,6 +2769,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				wsResult.ImageInputSize = imageInputSize
 				wsResult.BillingModel = imageBillingModel
 			}
+			s.recordOpenAIUpstreamRequestSuccess(account)
 			return wsResult, nil
 		}
 		s.writeOpenAIWSFallbackErrorResponse(c, account, wsErr)
@@ -2785,24 +2797,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 		if err != nil {
-			// Ensure the client receives an error response (handlers assume Forward writes on non-failover errors).
-			safeErr := sanitizeUpstreamErrorMessage(err.Error())
-			setOpsUpstreamError(c, 0, safeErr, "")
-			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-				Platform:           account.Platform,
-				AccountID:          account.ID,
-				AccountName:        account.Name,
-				UpstreamStatusCode: 0,
-				Kind:               "request_error",
-				Message:            safeErr,
-			})
-			c.JSON(http.StatusBadGateway, gin.H{
-				"error": gin.H{
-					"type":    "upstream_error",
-					"message": "Upstream request failed",
-				},
-			})
-			return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+			return nil, s.openAIUpstreamRequestErrorFailover(ctx, c, account, proxyURL, err, false)
 		}
 
 		// Handle error response
@@ -2915,6 +2910,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			forwardResult.ImageOutputSizes = imageOutputSizes
 			forwardResult.BillingModel = imageBillingModel
 		}
+		s.recordOpenAIUpstreamRequestSuccess(account)
 		return forwardResult, nil
 	}
 }
@@ -2943,27 +2939,10 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 
 	if account != nil && account.Type == AccountTypeOAuth {
-		if rejectReason := detectOpenAIPassthroughInstructionsRejectReason(reqModel, body); rejectReason != "" {
-			rejectMsg := "OpenAI codex passthrough requires a non-empty instructions field"
-			setOpsUpstreamError(c, http.StatusForbidden, rejectMsg, "")
-			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-				Platform:           account.Platform,
-				AccountID:          account.ID,
-				AccountName:        account.Name,
-				UpstreamStatusCode: http.StatusForbidden,
-				Passthrough:        true,
-				Kind:               "request_error",
-				Message:            rejectMsg,
-				Detail:             rejectReason,
-			})
-			logOpenAIPassthroughInstructionsRejected(ctx, c, account, reqModel, rejectReason, body)
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": gin.H{
-					"type":    "forbidden_error",
-					"message": rejectMsg,
-				},
-			})
-			return nil, fmt.Errorf("openai passthrough rejected before upstream: %s", rejectReason)
+		if normalizedBody, normalized, err := normalizeOpenAIPassthroughInstructions(body); err != nil {
+			return nil, err
+		} else if normalized {
+			body = normalizedBody
 		}
 
 		normalizedBody, normalized, err := normalizeOpenAIPassthroughOAuthBody(body, isOpenAIResponsesCompactPath(c))
@@ -3005,7 +2984,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	body = updatedBody
 
 	apiKey := getAPIKeyFromContext(c)
-	if IsImageGenerationIntent(openAIResponsesEndpoint, reqModel, body) && !GroupAllowsImageGeneration(apiKeyGroup(apiKey)) {
+	if IsOpenAIImageGenerationHardIntent(openAIResponsesEndpoint, reqModel, body) && !GroupAllowsImageGeneration(apiKeyGroup(apiKey)) {
 		setOpsUpstreamError(c, http.StatusForbidden, ImageGenerationPermissionMessage(), "")
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": gin.H{
@@ -3014,6 +2993,16 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			},
 		})
 		return nil, errors.New("image generation disabled for group")
+	}
+	if !GroupAllowsImageGeneration(apiKeyGroup(apiKey)) {
+		if reqBody := cloneRequestMapForImageIntent(body); removeOpenAIImageGenerationTools(reqBody) {
+			updated, err := json.Marshal(reqBody)
+			if err != nil {
+				return nil, fmt.Errorf("serialize image-disabled responses body: %w", err)
+			}
+			body = updated
+			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Removed passive passthrough /responses image_generation tool for image-disabled group")
+		}
 	}
 	imageBillingModel := ""
 	imageSizeTier := ""
@@ -3086,24 +3075,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 	if err != nil {
-		safeErr := sanitizeUpstreamErrorMessage(err.Error())
-		setOpsUpstreamError(c, 0, safeErr, "")
-		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-			Platform:           account.Platform,
-			AccountID:          account.ID,
-			AccountName:        account.Name,
-			UpstreamStatusCode: 0,
-			Passthrough:        true,
-			Kind:               "request_error",
-			Message:            safeErr,
-		})
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": gin.H{
-				"type":    "upstream_error",
-				"message": "Upstream request failed",
-			},
-		})
-		return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+		return nil, s.openAIUpstreamRequestErrorFailover(ctx, c, account, proxyURL, err, true)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -3168,6 +3140,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		forwardResult.ImageOutputSizes = imageOutputSizes
 		forwardResult.BillingModel = imageBillingModel
 	}
+	s.recordOpenAIUpstreamRequestSuccess(account)
 	return forwardResult, nil
 }
 
@@ -3319,10 +3292,10 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 
 func shouldFailoverOpenAIPassthroughResponse(statusCode int) bool {
 	switch statusCode {
-	case http.StatusTooManyRequests, 529:
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests, 529:
 		return true
 	default:
-		return false
+		return statusCode >= http.StatusInternalServerError
 	}
 }
 
@@ -6093,6 +6066,30 @@ func detectOpenAIPassthroughInstructionsRejectReason(reqModel string, body []byt
 		return "instructions_empty"
 	}
 	return ""
+}
+
+func normalizeOpenAIPassthroughInstructions(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 {
+		return body, false, nil
+	}
+	if instructions := strings.TrimSpace(gjson.GetBytes(body, "instructions").String()); instructions != "" {
+		return body, false, nil
+	}
+	existingInstructions := ""
+	if gjson.ValidBytes(body) {
+		var reqBody map[string]any
+		if err := json.Unmarshal(body, &reqBody); err == nil {
+			existingInstructions = strings.TrimSpace(extractPromptLikeInstructionsFromInput(reqBody))
+		}
+	}
+	if existingInstructions == "" {
+		existingInstructions = "You are a helpful coding assistant."
+	}
+	normalizedBody, err := sjson.SetBytes(body, "instructions", existingInstructions)
+	if err != nil {
+		return nil, false, err
+	}
+	return normalizedBody, true, nil
 }
 
 func extractOpenAIReasoningEffortFromBody(body []byte, requestedModel string) *string {
