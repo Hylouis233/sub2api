@@ -121,16 +121,19 @@ func TestSubscriptionFetchURLRejectsPrivateAddress(t *testing.T) {
 	}
 }
 
-func TestSubscriptionQualityPolicyDefaultsToNone(t *testing.T) {
+func TestSubscriptionQualityPolicyDefaultsToDisableD(t *testing.T) {
 	policy, err := normalizeSubscriptionQualityPolicy("")
 	if err != nil {
 		t.Fatalf("normalizeSubscriptionQualityPolicy error = %v", err)
 	}
-	if policy != proxySubscriptionQualityPolicyNone {
-		t.Fatalf("policy = %q, want %q", policy, proxySubscriptionQualityPolicyNone)
+	if policy != proxySubscriptionQualityPolicyDisableD {
+		t.Fatalf("policy = %q, want %q", policy, proxySubscriptionQualityPolicyDisableD)
 	}
-	if shouldDisableProxyForSubscriptionQuality(policy, "F") {
-		t.Fatal("default policy should not disable proxies")
+	if shouldDisableProxyForSubscriptionQuality(policy, "C") {
+		t.Fatal("C should stay enabled by default")
+	}
+	if !shouldDisableProxyForSubscriptionQuality(policy, "D") || !shouldDisableProxyForSubscriptionQuality(policy, "F") {
+		t.Fatal("D/F should be disabled by default")
 	}
 }
 

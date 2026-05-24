@@ -8,6 +8,8 @@ import type {
   Proxy,
   ProxyAccountSummary,
   ProxyQualityCheckResult,
+  ProxyQualityPolicyApplyRequest,
+  ProxyQualityPolicyApplyResult,
   ProxySubscriptionImportRequest,
   ProxySubscriptionImportResult,
   CreateProxyRequest,
@@ -158,6 +160,16 @@ export async function checkProxyQuality(id: number): Promise<ProxyQualityCheckRe
   return data
 }
 
+export async function applyQualityPolicy(
+  payload: ProxyQualityPolicyApplyRequest
+): Promise<ProxyQualityPolicyApplyResult> {
+  const { data } = await apiClient.post<ProxyQualityPolicyApplyResult>(
+    '/admin/proxies/apply-quality-policy',
+    payload
+  )
+  return data
+}
+
 /**
  * Get proxy usage statistics
  * @param id - Proxy ID
@@ -278,6 +290,7 @@ export const proxiesAPI = {
   toggleStatus,
   testProxy,
   checkProxyQuality,
+  applyQualityPolicy,
   getStats,
   getProxyAccounts,
   batchCreate,

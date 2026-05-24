@@ -742,6 +742,7 @@ export interface ProxyQualityCheckResult {
 }
 
 export type ProxySubscriptionQualityPolicy = 'none' | 'disable_d' | 'disable_c_or_below' | 'disable_b_or_below'
+export type ProxyQualityPolicy = Exclude<ProxySubscriptionQualityPolicy, 'none'>
 
 export interface ProxySubscriptionImportRequest {
   url?: string
@@ -761,6 +762,20 @@ export interface ProxySubscriptionImportResult {
   quality_checked: number
   quality_disabled: number
   quality_failed: number
+  errors?: string[]
+}
+
+export interface ProxyQualityPolicyApplyRequest {
+  ids: number[]
+  quality_policy: ProxyQualityPolicy
+}
+
+export interface ProxyQualityPolicyApplyResult {
+  total: number
+  quality_checked: number
+  quality_disabled: number
+  quality_failed: number
+  disabled_ids: number[]
   errors?: string[]
 }
 

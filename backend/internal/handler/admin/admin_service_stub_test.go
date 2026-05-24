@@ -24,6 +24,7 @@ type stubAdminService struct {
 	updatedProxyIDs      []int64
 	updatedProxies       []*service.UpdateProxyInput
 	testedProxyIDs       []int64
+	qualityResults       map[int64]*service.ProxyQualityCheckResult
 	createAccountErr     error
 	updateAccountErr     error
 	bulkUpdateAccountErr error
@@ -492,6 +493,11 @@ func (s *stubAdminService) TestProxy(ctx context.Context, id int64) (*service.Pr
 }
 
 func (s *stubAdminService) CheckProxyQuality(ctx context.Context, id int64) (*service.ProxyQualityCheckResult, error) {
+	if s.qualityResults != nil {
+		if result, ok := s.qualityResults[id]; ok {
+			return result, nil
+		}
+	}
 	return &service.ProxyQualityCheckResult{
 		ProxyID:        id,
 		Score:          95,

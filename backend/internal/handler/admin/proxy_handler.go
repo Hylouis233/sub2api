@@ -103,6 +103,20 @@ type importProxySubscriptionResult struct {
 	Errors          []string `json:"errors,omitempty"`
 }
 
+type applyProxyQualityPolicyRequest struct {
+	IDs           []int64 `json:"ids" binding:"required,min=1,max=1000,dive,min=1"`
+	QualityPolicy string  `json:"quality_policy" binding:"required"`
+}
+
+type applyProxyQualityPolicyResult struct {
+	Total           int      `json:"total"`
+	QualityChecked  int      `json:"quality_checked"`
+	QualityDisabled int      `json:"quality_disabled"`
+	QualityFailed   int      `json:"quality_failed"`
+	DisabledIDs     []int64  `json:"disabled_ids"`
+	Errors          []string `json:"errors,omitempty"`
+}
+
 // List handles listing all proxies with pagination
 // GET /api/v1/admin/proxies
 func (h *ProxyHandler) List(c *gin.Context) {
@@ -313,6 +327,76 @@ func (h *ProxyHandler) CheckQuality(c *gin.Context) {
 	}
 
 	response.Success(c, result)
+}
+
+// ApplyQualityPolicy checks selected proxies and disables those below the
+// chosen quality threshold.
+// POST /api/v1/admin/proxies/apply-quality-policy
+func (h *ProxyHandler) ApplyQualityPolicy(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+	var req applyProxyQualityPolicyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	policy, err := normalizeSubscriptionQualityPolicy(req.QualityPolicy)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if policy == proxySubscriptionQualityPolicyNone {
+		response.BadRequest(c, "quality_policy must disable at least one grade")
+		return
+	}
+
+	ids := uniquePositiveProxyIDs(req.IDs)
+	if len(ids) == 0 {
+		response.BadRequest(c, "ids is required")
+		return
+	}
+	req.IDs = ids
+	req.QualityPolicy = policy
+
+	executeAdminIdempotentJSON(c, "admin.proxies.apply_quality_policy", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
+		result := applyProxyQualityPolicyResult{Total: len(ids)}
+		for _, id := range ids {
+			quality, err := h.adminService.CheckProxyQuality(ctx, id)
+			if err != nil {
+				result.QualityFailed++
+				result.Errors = append(result.Errors, "proxy "+strconv.FormatInt(id, 10)+" quality check: "+err.Error())
+				continue
+			}
+			result.QualityChecked++
+			if !shouldDisableProxyForSubscriptionQuality(policy, quality.Grade) {
+				continue
+			}
+			if _, err := h.adminService.UpdateProxy(ctx, id, &service.UpdateProxyInput{Status: service.StatusDisabled}); err != nil {
+				result.QualityFailed++
+				result.Errors = append(result.Errors, "proxy "+strconv.FormatInt(id, 10)+" disable: "+err.Error())
+				continue
+			}
+			result.QualityDisabled++
+			result.DisabledIDs = append(result.DisabledIDs, id)
+		}
+		return result, nil
+	})
+}
+
+func uniquePositiveProxyIDs(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	result := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
 }
 
 // GetStats handles getting proxy statistics
@@ -527,8 +611,8 @@ func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
 
 func normalizeSubscriptionQualityPolicy(value string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "default":
-		return proxySubscriptionQualityPolicyNone, nil
+	case "", "default", proxySubscriptionQualityPolicyDisableD:
+		return proxySubscriptionQualityPolicyDisableD, nil
 	case proxySubscriptionQualityPolicyNone:
 		return proxySubscriptionQualityPolicyNone, nil
 	case proxySubscriptionQualityPolicyDisableCOrBelow:
