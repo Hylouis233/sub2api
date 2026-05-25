@@ -689,6 +689,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	done := make(chan struct{})
 	var lastReadAt int64
 	atomic.StoreInt64(&lastReadAt, time.Now().UnixNano())
+	streamBodyStartedAt := time.Now()
 	sendEvent := func(ev scanEvent) bool {
 		select {
 		case events <- ev:
@@ -755,15 +756,21 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			}
 
 		case <-intervalCh:
-			lastRead := time.Unix(0, atomic.LoadInt64(&lastReadAt))
-			if time.Since(lastRead) < streamInterval {
-				continue
-			}
 			if clientDisconnected {
 				return resultWithUsage(), fmt.Errorf("stream usage incomplete after timeout")
 			}
-			if !clientOutputStarted {
+			if !openAIStreamClientOutputStarted(c, clientOutputStarted) {
+				if time.Since(streamBodyStartedAt) < streamInterval {
+					continue
+				}
 				s.recordOpenAIUpstreamStreamTimeout(context.Background(), account, proxyURL, originalModel, streamInterval)
+				msg := fmt.Sprintf("OpenAI stream did not produce first payload before timeout: %s", streamInterval)
+				logger.LegacyPrintf("service.openai_gateway", "Chat completions stream first payload timeout: account=%d model=%s interval=%s", account.ID, originalModel, streamInterval)
+				return resultWithUsage(), s.newOpenAIStreamFailoverError(c, account, false, requestID, nil, msg)
+			}
+			lastRead := time.Unix(0, atomic.LoadInt64(&lastReadAt))
+			if time.Since(lastRead) < streamInterval {
+				continue
 			}
 			logger.L().Warn("openai chat_completions stream: data interval timeout",
 				zap.String("request_id", requestID),

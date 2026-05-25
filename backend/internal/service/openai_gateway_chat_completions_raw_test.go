@@ -338,6 +338,50 @@ func TestHandleChatStreamingResponse_SilentRefusalReasoningSummaryExempt(t *test
 	require.Contains(t, rec.Body.String(), "data: [DONE]")
 }
 
+func TestHandleChatStreamingResponse_FirstPayloadTimeoutReturnsFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := rawChatCompletionsTestConfig()
+	cfg.Gateway.StreamDataIntervalTimeout = 1
+	cfg.Gateway.StreamKeepaliveInterval = 0
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_chat_first_payload_timeout"}},
+		Body:       pr,
+	}
+
+	result, err := svc.handleChatStreamingResponse(
+		resp,
+		c,
+		rawChatCompletionsTestAccount(),
+		"socks5://host.docker.internal:17817",
+		"gpt-5.5",
+		"gpt-5.5",
+		"gpt-5.5",
+		false,
+		time.Now(),
+		0,
+	)
+	_ = pw.Close()
+	_ = pr.Close()
+
+	require.NotNil(t, result)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Contains(t, string(failoverErr.ResponseBody), "did not produce first payload")
+	require.False(t, c.Writer.Written())
+	require.Empty(t, rec.Body.String())
+}
+
 func TestForwardAsRawChatCompletions_SilentRefusalNormalContentExempt(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
