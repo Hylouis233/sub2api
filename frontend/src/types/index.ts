@@ -1016,6 +1016,7 @@ export interface CreateAccountRequest {
   credentials: Record<string, unknown>
   extra?: Record<string, unknown>
   proxy_id?: number | null
+  auto_bind_proxy?: boolean
   concurrency?: number
   load_factor?: number | null
   priority?: number
@@ -1147,6 +1148,7 @@ export interface CodexSessionImportRequest {
   load_factor?: number | null
   expires_at?: number | null
   auto_pause_on_expired?: boolean
+  auto_bind_proxy?: boolean
   credential_extras?: Record<string, unknown>
   extra?: Record<string, unknown>
   update_existing?: boolean

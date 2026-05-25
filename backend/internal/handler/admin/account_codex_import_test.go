@@ -1,12 +1,18 @@
 package admin
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseCodexSessionImportEntriesSupportsRawTokenJSONAndArray(t *testing.T) {
@@ -142,7 +148,7 @@ func TestNormalizeCodexSessionJSONExtractsCredentialsAndIgnoresSessionToken(t *t
 	}
 }
 
-func TestMergeCodexImportCredentialsClearsStaleRefreshFieldsWhenIncomingHasNoRefreshToken(t *testing.T) {
+func TestMergeCodexImportCredentialsPreservesRefreshFieldsWhenIncomingHasNoRefreshToken(t *testing.T) {
 	existing := map[string]any{
 		"access_token":       "old-access-token",
 		"refresh_token":      "old-refresh-token",
@@ -169,11 +175,11 @@ func TestMergeCodexImportCredentialsClearsStaleRefreshFieldsWhenIncomingHasNoRef
 	if merged["chatgpt_account_id"] != "acct-new" {
 		t.Fatalf("chatgpt_account_id = %v, want acct-new", merged["chatgpt_account_id"])
 	}
-	if _, ok := merged["refresh_token"]; ok {
-		t.Fatalf("refresh_token should be cleared")
+	if merged["refresh_token"] != "old-refresh-token" {
+		t.Fatalf("refresh_token = %v, want old-refresh-token", merged["refresh_token"])
 	}
-	if _, ok := merged["client_id"]; ok {
-		t.Fatalf("client_id should be cleared")
+	if merged["client_id"] != "old-client-id" {
+		t.Fatalf("client_id = %v, want old-client-id", merged["client_id"])
 	}
 	if _, ok := merged["id_token"]; ok {
 		t.Fatalf("id_token should be cleared")
@@ -215,6 +221,60 @@ func TestMergeCodexImportCredentialsKeepsRefreshFieldsWhenIncomingHasRefreshToke
 	if merged["id_token"] != "new-id-token" {
 		t.Fatalf("id_token = %v, want new-id-token", merged["id_token"])
 	}
+}
+
+func TestNormalizeCodexImportEntryAcceptsRTOnlyRawLine(t *testing.T) {
+	item, err := normalizeCodexImportEntry(codexImportEntry{Index: 1, Value: "rt_test_refresh_token"})
+	require.NoError(t, err)
+	require.Empty(t, item.AccessToken)
+	require.Equal(t, "rt_test_refresh_token", item.RefreshToken)
+	require.Equal(t, "rt_test_refresh_token", item.Credentials["refresh_token"])
+	require.Equal(t, openai.ClientID, item.Credentials["client_id"])
+}
+
+func TestImportCodexSessionsRefreshesRTOnlyEntryAndPreservesOriginalRT(t *testing.T) {
+	accessToken := buildCodexImportTestJWT(t, time.Now().Add(time.Hour), map[string]any{
+		"email": "rt-only@example.com",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct-rt-only",
+			"chatgpt_user_id":    "user-rt-only",
+			"chatgpt_plan_type":  "plus",
+			"poid":               "org-rt-only",
+		},
+	})
+	client := &codexImportOpenAIRefreshClient{
+		response: &openai.TokenResponse{
+			AccessToken: accessToken,
+			ExpiresIn:   3600,
+		},
+	}
+	adminSvc := newStubAdminService()
+	adminSvc.accounts = nil
+	openaiSvc := service.NewOpenAIOAuthService(nil, client)
+	handler := NewAccountHandler(adminSvc, nil, openaiSvc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	proxyID := int64(4)
+
+	result, err := handler.importCodexSessions(context.Background(), CodexSessionImportRequest{
+		ProxyID: &proxyID,
+	}, []codexImportEntry{
+		{Index: 1, Value: map[string]any{"rt": "rt_original_only"}},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Created)
+	require.Equal(t, 0, result.Failed)
+	require.Len(t, adminSvc.createdAccounts, 1)
+	require.Equal(t, "rt_original_only", client.refreshToken)
+	require.Equal(t, openai.ClientID, client.clientID)
+	require.Contains(t, client.proxyURL, "127.0.0.1:8080")
+
+	credentials := adminSvc.createdAccounts[0].Credentials
+	require.Equal(t, accessToken, credentials["access_token"])
+	require.Equal(t, "rt_original_only", credentials["refresh_token"])
+	require.Equal(t, openai.ClientID, credentials["client_id"])
+	require.Equal(t, "rt-only@example.com", credentials["email"])
+	require.Equal(t, "acct-rt-only", credentials["chatgpt_account_id"])
+	require.Equal(t, "user-rt-only", credentials["chatgpt_user_id"])
 }
 
 func TestNormalizeCodexImportRejectsExpiredAccessToken(t *testing.T) {
@@ -316,6 +376,32 @@ func TestCodexIdentityKeysPreferStrongIdentifiers(t *testing.T) {
 	if !hasEmail {
 		t.Fatalf("weak identity should include email fallback: %v", keys)
 	}
+}
+
+type codexImportOpenAIRefreshClient struct {
+	response     *openai.TokenResponse
+	err          error
+	refreshToken string
+	proxyURL     string
+	clientID     string
+}
+
+func (c *codexImportOpenAIRefreshClient) ExchangeCode(context.Context, string, string, string, string, string) (*openai.TokenResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *codexImportOpenAIRefreshClient) RefreshToken(context.Context, string, string) (*openai.TokenResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *codexImportOpenAIRefreshClient) RefreshTokenWithClientID(_ context.Context, refreshToken, proxyURL string, clientID string) (*openai.TokenResponse, error) {
+	c.refreshToken = refreshToken
+	c.proxyURL = proxyURL
+	c.clientID = clientID
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.response, nil
 }
 
 func buildCodexImportTestJWT(t *testing.T, exp time.Time, extraClaims map[string]any) string {

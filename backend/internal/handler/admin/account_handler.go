@@ -109,6 +109,7 @@ type CreateAccountRequest struct {
 	GroupIDs                []int64        `json:"group_ids"`
 	ExpiresAt               *int64         `json:"expires_at"`
 	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
+	AutoBindProxy           *bool          `json:"auto_bind_proxy"`
 	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
 }
 
@@ -548,6 +549,7 @@ func (h *AccountHandler) Create(c *gin.Context) {
 			GroupIDs:              req.GroupIDs,
 			ExpiresAt:             req.ExpiresAt,
 			AutoPauseOnExpired:    req.AutoPauseOnExpired,
+			AutoBindProxy:         req.AutoBindProxy != nil && *req.AutoBindProxy,
 			SkipMixedChannelCheck: skipCheck,
 		})
 		if execErr != nil {
@@ -983,6 +985,10 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 	var newCredentials map[string]any
 
 	if account.IsOpenAI() {
+		if strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
+			return nil, "", infraerrors.BadRequest("OPENAI_OAUTH_NO_REFRESH_TOKEN", "refresh_token is required to refresh OpenAI OAuth account; reauthorize the account")
+		}
+
 		tokenInfo, err := h.openaiOAuthService.RefreshAccountToken(ctx, account)
 		if err != nil {
 			// 刷新失败但 access_token 可能仍有效，尝试设置隐私
@@ -1390,6 +1396,10 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 			sanitizeExtraBaseRPM(item.Extra)
 
 			skipCheck := item.ConfirmMixedChannelRisk != nil && *item.ConfirmMixedChannelRisk
+			autoBindProxy := true
+			if item.AutoBindProxy != nil {
+				autoBindProxy = *item.AutoBindProxy
+			}
 
 			account, err := h.adminService.CreateAccount(ctx, &service.CreateAccountInput{
 				Name:                  item.Name,
@@ -1405,6 +1415,7 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 				GroupIDs:              item.GroupIDs,
 				ExpiresAt:             item.ExpiresAt,
 				AutoPauseOnExpired:    item.AutoPauseOnExpired,
+				AutoBindProxy:         autoBindProxy,
 				SkipMixedChannelCheck: skipCheck,
 			})
 			if err != nil {

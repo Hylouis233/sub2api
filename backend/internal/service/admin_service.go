@@ -273,6 +273,8 @@ type CreateAccountInput struct {
 	GroupIDs           []int64
 	ExpiresAt          *int64
 	AutoPauseOnExpired *bool
+	// AutoBindProxy assigns an active proxy when ProxyID is omitted.
+	AutoBindProxy bool
 	// SkipDefaultGroupBind prevents auto-binding to platform default group when GroupIDs is empty.
 	SkipDefaultGroupBind bool
 	// SkipMixedChannelCheck skips the mixed channel risk check when binding groups.
@@ -281,21 +283,23 @@ type CreateAccountInput struct {
 }
 
 type UpdateAccountInput struct {
-	Name                  string
-	Notes                 *string
-	Type                  string // Account type: oauth, setup-token, apikey
-	Credentials           map[string]any
-	Extra                 map[string]any
-	ProxyID               *int64
-	Concurrency           *int     // 使用指针区分"未提供"和"设置为0"
-	Priority              *int     // 使用指针区分"未提供"和"设置为0"
-	RateMultiplier        *float64 // 账号计费倍率（>=0，允许 0）
-	LoadFactor            *int
-	Status                string
-	GroupIDs              *[]int64
-	ExpiresAt             *int64
-	AutoPauseOnExpired    *bool
-	SkipMixedChannelCheck bool // 跳过混合渠道检查（用户已确认风险）
+	Name                   string
+	Notes                  *string
+	Type                   string // Account type: oauth, setup-token, apikey
+	Credentials            map[string]any
+	Extra                  map[string]any
+	ProxyID                *int64
+	Concurrency            *int     // 使用指针区分"未提供"和"设置为0"
+	Priority               *int     // 使用指针区分"未提供"和"设置为0"
+	RateMultiplier         *float64 // 账号计费倍率（>=0，允许 0）
+	LoadFactor             *int
+	Status                 string
+	GroupIDs               *[]int64
+	ExpiresAt              *int64
+	AutoPauseOnExpired     *bool
+	AutoBindProxy          bool
+	EnsureDefaultGroupBind bool
+	SkipMixedChannelCheck  bool // 跳过混合渠道检查（用户已确认风险）
 }
 
 // BulkUpdateAccountsInput describes the payload for bulk updating accounts.
@@ -2355,21 +2359,95 @@ func (s *adminServiceImpl) GetAccountsByIDs(ctx context.Context, ids []int64) ([
 	return accounts, nil
 }
 
+func (s *adminServiceImpl) resolveDefaultAccountGroupIDs(ctx context.Context, platform string) []int64 {
+	if s.groupRepo == nil || strings.TrimSpace(platform) == "" {
+		return nil
+	}
+
+	groups, err := s.groupRepo.ListActiveByPlatform(ctx, platform)
+	if err != nil {
+		return nil
+	}
+
+	platformDefaultName := platform + "-default"
+	for _, g := range groups {
+		if strings.EqualFold(g.Name, "default") {
+			return []int64{g.ID}
+		}
+	}
+	for _, g := range groups {
+		if strings.EqualFold(g.Name, platformDefaultName) {
+			return []int64{g.ID}
+		}
+	}
+	return nil
+}
+
+func (s *adminServiceImpl) resolveAutoProxyID(ctx context.Context) (*int64, error) {
+	if s.proxyRepo == nil {
+		return nil, nil
+	}
+
+	proxies, err := s.proxyRepo.ListActiveWithAccountCount(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("auto bind proxy: %w", err)
+	}
+	if len(proxies) == 0 {
+		return nil, nil
+	}
+
+	sort.Slice(proxies, func(i, j int) bool {
+		if proxies[i].AccountCount != proxies[j].AccountCount {
+			return proxies[i].AccountCount < proxies[j].AccountCount
+		}
+		return proxies[i].ID < proxies[j].ID
+	})
+
+	proxyID := proxies[0].ID
+	return &proxyID, nil
+}
+
+func accountGroupIDs(account *Account) []int64 {
+	if account == nil {
+		return nil
+	}
+	if len(account.GroupIDs) > 0 {
+		return append([]int64(nil), account.GroupIDs...)
+	}
+	groupIDs := make([]int64, 0, len(account.AccountGroups))
+	for _, group := range account.AccountGroups {
+		if group.GroupID > 0 && !containsInt64(groupIDs, group.GroupID) {
+			groupIDs = append(groupIDs, group.GroupID)
+		}
+	}
+	return groupIDs
+}
+
+func mergeAccountGroupIDs(existing []int64, required []int64) []int64 {
+	merged := append([]int64(nil), existing...)
+	for _, groupID := range required {
+		if groupID > 0 && !containsInt64(merged, groupID) {
+			merged = append(merged, groupID)
+		}
+	}
+	return merged
+}
+
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
 	// 绑定分组
 	groupIDs := input.GroupIDs
 	// 如果没有指定分组,自动绑定对应平台的默认分组
 	if len(groupIDs) == 0 && !input.SkipDefaultGroupBind {
-		defaultGroupName := input.Platform + "-default"
-		groups, err := s.groupRepo.ListActiveByPlatform(ctx, input.Platform)
-		if err == nil {
-			for _, g := range groups {
-				if g.Name == defaultGroupName {
-					groupIDs = []int64{g.ID}
-					break
-				}
-			}
+		groupIDs = s.resolveDefaultAccountGroupIDs(ctx, input.Platform)
+	}
+
+	proxyID := input.ProxyID
+	if proxyID == nil && input.AutoBindProxy {
+		resolvedProxyID, err := s.resolveAutoProxyID(ctx)
+		if err != nil {
+			return nil, err
 		}
+		proxyID = resolvedProxyID
 	}
 
 	// 检查混合渠道风险（除非用户已确认）
@@ -2386,7 +2464,7 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 		Type:        input.Type,
 		Credentials: input.Credentials,
 		Extra:       input.Extra,
-		ProxyID:     input.ProxyID,
+		ProxyID:     proxyID,
 		Concurrency: input.Concurrency,
 		Priority:    input.Priority,
 		Status:      StatusActive,
@@ -2515,6 +2593,15 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			account.ProxyID = input.ProxyID
 		}
 		account.Proxy = nil // 清除关联对象，防止 GORM Save 时根据 Proxy.ID 覆盖 ProxyID
+	} else if input.AutoBindProxy && account.ProxyID == nil {
+		resolvedProxyID, err := s.resolveAutoProxyID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if resolvedProxyID != nil {
+			account.ProxyID = resolvedProxyID
+			account.Proxy = nil
+		}
 	}
 	// 只在指针非 nil 时更新 Concurrency（支持设置为 0）
 	if input.Concurrency != nil {
@@ -2554,15 +2641,23 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		account.AutoPauseOnExpired = *input.AutoPauseOnExpired
 	}
 
+	groupIDsToBind := input.GroupIDs
+	if groupIDsToBind == nil && input.EnsureDefaultGroupBind {
+		if defaultGroupIDs := s.resolveDefaultAccountGroupIDs(ctx, account.Platform); len(defaultGroupIDs) > 0 {
+			mergedGroupIDs := mergeAccountGroupIDs(accountGroupIDs(account), defaultGroupIDs)
+			groupIDsToBind = &mergedGroupIDs
+		}
+	}
+
 	// 先验证分组是否存在（在任何写操作之前）
-	if input.GroupIDs != nil {
-		if err := s.validateGroupIDsExist(ctx, *input.GroupIDs); err != nil {
+	if groupIDsToBind != nil {
+		if err := s.validateGroupIDsExist(ctx, *groupIDsToBind); err != nil {
 			return nil, err
 		}
 
 		// 检查混合渠道风险（除非用户已确认）
 		if !input.SkipMixedChannelCheck {
-			if err := s.checkMixedChannelRisk(ctx, account.ID, account.Platform, *input.GroupIDs); err != nil {
+			if err := s.checkMixedChannelRisk(ctx, account.ID, account.Platform, *groupIDsToBind); err != nil {
 				return nil, err
 			}
 		}
@@ -2573,8 +2668,8 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	}
 
 	// 绑定分组
-	if input.GroupIDs != nil {
-		if err := s.accountRepo.BindGroups(ctx, account.ID, *input.GroupIDs); err != nil {
+	if groupIDsToBind != nil {
+		if err := s.accountRepo.BindGroups(ctx, account.ID, *groupIDsToBind); err != nil {
 			return nil, err
 		}
 	}

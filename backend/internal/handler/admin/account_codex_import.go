@@ -34,6 +34,7 @@ type CodexSessionImportRequest struct {
 	LoadFactor              *int           `json:"load_factor"`
 	ExpiresAt               *int64         `json:"expires_at"`
 	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
+	AutoBindProxy           *bool          `json:"auto_bind_proxy"`
 	CredentialExtras        map[string]any `json:"credential_extras"`
 	Extra                   map[string]any `json:"extra"`
 	UpdateExisting          *bool          `json:"update_existing"`
@@ -77,6 +78,7 @@ type codexImportAccount struct {
 	AccessToken    string
 	RefreshToken   string
 	IDToken        string
+	ClientID       string
 	Email          string
 	AccountID      string
 	UserID         string
@@ -191,12 +193,29 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 	if req.SkipDefaultGroupBind != nil {
 		skipDefaultGroupBind = *req.SkipDefaultGroupBind
 	}
+	autoBindProxy := true
+	if req.AutoBindProxy != nil {
+		autoBindProxy = *req.AutoBindProxy
+	}
 	skipMixedChannelCheck := req.ConfirmMixedChannelRisk != nil && *req.ConfirmMixedChannelRisk
 
 	seenIdentity := map[string]int{}
 	for _, entry := range entries {
 		item, err := normalizeCodexImportEntry(entry)
 		if err != nil {
+			result.Failed++
+			result.Items = append(result.Items, CodexSessionImportItem{
+				Index:   entry.Index,
+				Action:  "failed",
+				Message: err.Error(),
+			})
+			result.Errors = append(result.Errors, CodexSessionImportMessage{
+				Index:   entry.Index,
+				Message: err.Error(),
+			})
+			continue
+		}
+		if err := h.refreshCodexImportRTOnlyAccount(ctx, req, item, entry.Index); err != nil {
 			result.Failed++
 			result.Items = append(result.Items, CodexSessionImportItem{
 				Index:   entry.Index,
@@ -244,14 +263,16 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 			mergedCredentials := mergeCodexImportCredentials(targetAccount.Credentials, credentials, item)
 			mergedExtra := mergeCodexImportMap(targetAccount.Extra, extra)
 			updateInput := &service.UpdateAccountInput{
-				Credentials:        mergedCredentials,
-				Extra:              mergedExtra,
-				Concurrency:        req.Concurrency,
-				Priority:           req.Priority,
-				RateMultiplier:     req.RateMultiplier,
-				LoadFactor:         req.LoadFactor,
-				ExpiresAt:          effectiveExpiresAt,
-				AutoPauseOnExpired: autoPauseOnExpired,
+				Credentials:            mergedCredentials,
+				Extra:                  mergedExtra,
+				Concurrency:            req.Concurrency,
+				Priority:               req.Priority,
+				RateMultiplier:         req.RateMultiplier,
+				LoadFactor:             req.LoadFactor,
+				ExpiresAt:              effectiveExpiresAt,
+				AutoPauseOnExpired:     autoPauseOnExpired,
+				AutoBindProxy:          autoBindProxy,
+				EnsureDefaultGroupBind: !skipDefaultGroupBind,
 			}
 			if req.ProxyID != nil {
 				updateInput.ProxyID = req.ProxyID
@@ -318,14 +339,16 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 			mergedCredentials := mergeCodexImportCredentials(existing.Credentials, credentials, item)
 			mergedExtra := mergeCodexImportMap(existing.Extra, extra)
 			updateInput := &service.UpdateAccountInput{
-				Credentials:        mergedCredentials,
-				Extra:              mergedExtra,
-				Concurrency:        req.Concurrency,
-				Priority:           req.Priority,
-				RateMultiplier:     req.RateMultiplier,
-				LoadFactor:         req.LoadFactor,
-				ExpiresAt:          effectiveExpiresAt,
-				AutoPauseOnExpired: autoPauseOnExpired,
+				Credentials:            mergedCredentials,
+				Extra:                  mergedExtra,
+				Concurrency:            req.Concurrency,
+				Priority:               req.Priority,
+				RateMultiplier:         req.RateMultiplier,
+				LoadFactor:             req.LoadFactor,
+				ExpiresAt:              effectiveExpiresAt,
+				AutoPauseOnExpired:     autoPauseOnExpired,
+				AutoBindProxy:          autoBindProxy,
+				EnsureDefaultGroupBind: !skipDefaultGroupBind,
 			}
 			if req.ProxyID != nil {
 				updateInput.ProxyID = req.ProxyID
@@ -384,6 +407,7 @@ func (h *AccountHandler) importCodexSessions(ctx context.Context, req CodexSessi
 			GroupIDs:              req.GroupIDs,
 			ExpiresAt:             effectiveExpiresAt,
 			AutoPauseOnExpired:    autoPauseOnExpired,
+			AutoBindProxy:         autoBindProxy,
 			SkipDefaultGroupBind:  skipDefaultGroupBind,
 			SkipMixedChannelCheck: skipMixedChannelCheck,
 		})
@@ -541,20 +565,30 @@ func normalizeCodexImportEntry(entry codexImportEntry) (*codexImportAccount, err
 
 	switch raw := entry.Value.(type) {
 	case string:
-		item.AccessToken = strings.TrimSpace(raw)
+		item.AccessToken, item.RefreshToken = normalizeCodexRawTokenString(raw)
 	case map[string]any:
 		item.AccessToken = firstCodexString(raw,
 			[]string{"tokens", "access_token"},
 			[]string{"tokens", "accessToken"},
+			[]string{"tokens", "at"},
 			[]string{"access_token"},
 			[]string{"accessToken"},
+			[]string{"at"},
 			[]string{"token"},
 		)
 		item.RefreshToken = firstCodexString(raw,
 			[]string{"tokens", "refresh_token"},
 			[]string{"tokens", "refreshToken"},
+			[]string{"tokens", "rt"},
 			[]string{"refresh_token"},
 			[]string{"refreshToken"},
+			[]string{"rt"},
+		)
+		item.ClientID = firstCodexString(raw,
+			[]string{"tokens", "client_id"},
+			[]string{"tokens", "clientId"},
+			[]string{"client_id"},
+			[]string{"clientId"},
 		)
 		item.IDToken = firstCodexString(raw,
 			[]string{"tokens", "id_token"},
@@ -624,20 +658,86 @@ func normalizeCodexImportEntry(entry codexImportEntry) (*codexImportAccount, err
 		return nil, fmt.Errorf("第 %d 条格式不支持", entry.Index)
 	}
 
-	if item.AccessToken == "" {
-		return nil, errors.New("缺少 accessToken/access_token")
+	if item.AccessToken == "" && item.RefreshToken == "" {
+		return nil, errors.New("缺少 accessToken/access_token 或 refresh_token/rt")
 	}
-	item.Credentials["access_token"] = item.AccessToken
 	if item.RefreshToken != "" {
 		item.Credentials["refresh_token"] = item.RefreshToken
-		item.Credentials["client_id"] = openai.ClientID
+		if item.ClientID == "" {
+			item.ClientID = openai.ClientID
+		}
+		item.Credentials["client_id"] = item.ClientID
 	}
 	if item.IDToken != "" {
 		item.Credentials["id_token"] = item.IDToken
 		_ = enrichCodexImportAccountFromJWT(item, item.IDToken, false, now)
 	}
+	if item.AccessToken != "" {
+		if err := finalizeCodexImportAccessToken(item, entry.Index, now); err != nil {
+			return nil, err
+		}
+	} else {
+		setCodexCredentialIfNotEmpty(item.Credentials, "email", item.Email)
+		setCodexCredentialIfNotEmpty(item.Credentials, "chatgpt_account_id", item.AccountID)
+		setCodexCredentialIfNotEmpty(item.Credentials, "chatgpt_user_id", item.UserID)
+		setCodexCredentialIfNotEmpty(item.Credentials, "organization_id", item.Organization)
+		setCodexCredentialIfNotEmpty(item.Credentials, "plan_type", item.PlanType)
+		item.IdentityKeys = buildCodexIdentityKeys(item.AccountID, item.UserID, item.Email, "")
+		item.Name = buildCodexImportAccountName(item, entry.Index)
+	}
+
+	return item, nil
+}
+
+func normalizeCodexRawTokenString(raw string) (accessToken string, refreshToken string) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", ""
+	}
+	if key, token, ok := splitCodexTokenAssignment(value); ok {
+		switch strings.ToLower(key) {
+		case "refresh_token", "refreshtoken", "rt":
+			return "", token
+		case "access_token", "accesstoken", "at", "token":
+			return token, ""
+		}
+	}
+	if looksLikeCodexRefreshToken(value) {
+		return "", value
+	}
+	return value, ""
+}
+
+func splitCodexTokenAssignment(value string) (key string, token string, ok bool) {
+	for _, sep := range []string{"=", ":"} {
+		before, after, found := strings.Cut(value, sep)
+		if !found {
+			continue
+		}
+		normalizedKey := strings.TrimSpace(before)
+		normalizedToken := strings.Trim(strings.TrimSpace(after), `"'`)
+		if normalizedKey == "" || normalizedToken == "" {
+			continue
+		}
+		return normalizedKey, normalizedToken, true
+	}
+	return "", "", false
+}
+
+func looksLikeCodexRefreshToken(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(normalized, "rt_") ||
+		strings.HasPrefix(normalized, "rt-") ||
+		strings.HasPrefix(normalized, "rt.")
+}
+
+func finalizeCodexImportAccessToken(item *codexImportAccount, index int, now time.Time) error {
+	if item == nil {
+		return errors.New("导入项为空")
+	}
+	item.Credentials["access_token"] = item.AccessToken
 	if err := enrichCodexImportAccountFromJWT(item, item.AccessToken, true, now); err != nil {
-		return nil, err
+		return err
 	}
 	if _, ok := item.Credentials["expires_at"]; !ok {
 		item.WarningTexts = append(item.WarningTexts, "无法从 accessToken 解析过期时间，导入后需自行确认令牌有效性")
@@ -655,9 +755,75 @@ func normalizeCodexImportEntry(entry codexImportEntry) (*codexImportAccount, err
 	fingerprint := codexTokenFingerprint(item.AccessToken)
 	item.Extra["access_token_sha256"] = fingerprint
 	item.IdentityKeys = buildCodexIdentityKeys(item.AccountID, item.UserID, item.Email, item.AccessToken)
-	item.Name = buildCodexImportAccountName(item, entry.Index)
+	item.Name = buildCodexImportAccountName(item, index)
+	return nil
+}
 
-	return item, nil
+func (h *AccountHandler) refreshCodexImportRTOnlyAccount(ctx context.Context, req CodexSessionImportRequest, item *codexImportAccount, index int) error {
+	if item == nil || strings.TrimSpace(item.AccessToken) != "" {
+		return nil
+	}
+	refreshToken := strings.TrimSpace(item.RefreshToken)
+	if refreshToken == "" {
+		return errors.New("缺少 accessToken/access_token 或 refresh_token/rt")
+	}
+	if h.openaiOAuthService == nil {
+		return errors.New("仅包含 refresh_token，当前服务未启用 OpenAI OAuth 刷新能力")
+	}
+
+	var proxyURL string
+	if req.ProxyID != nil && h.adminService != nil {
+		if proxy, err := h.adminService.GetProxy(ctx, *req.ProxyID); err == nil && proxy != nil {
+			proxyURL = proxy.URL()
+		}
+	}
+	clientID := strings.TrimSpace(item.ClientID)
+	if clientID == "" {
+		clientID, _ = openai.OAuthClientConfigByPlatform(service.PlatformOpenAI)
+	}
+	tokenInfo, err := h.openaiOAuthService.RefreshTokenWithClientID(ctx, refreshToken, proxyURL, clientID)
+	if err != nil {
+		return fmt.Errorf("refresh_token 刷新 access_token 失败: %w", err)
+	}
+	if tokenInfo == nil || strings.TrimSpace(tokenInfo.AccessToken) == "" {
+		return errors.New("refresh_token 刷新结果缺少 access_token")
+	}
+	if strings.TrimSpace(tokenInfo.RefreshToken) == "" {
+		tokenInfo.RefreshToken = refreshToken
+	}
+	if strings.TrimSpace(tokenInfo.ClientID) == "" {
+		tokenInfo.ClientID = clientID
+	}
+
+	item.AccessToken = strings.TrimSpace(tokenInfo.AccessToken)
+	item.RefreshToken = strings.TrimSpace(tokenInfo.RefreshToken)
+	item.ClientID = strings.TrimSpace(tokenInfo.ClientID)
+	if strings.TrimSpace(tokenInfo.IDToken) != "" {
+		item.IDToken = strings.TrimSpace(tokenInfo.IDToken)
+	}
+	setCodexStringIfEmpty(&item.Email, tokenInfo.Email)
+	setCodexStringIfEmpty(&item.AccountID, tokenInfo.ChatGPTAccountID)
+	setCodexStringIfEmpty(&item.UserID, tokenInfo.ChatGPTUserID)
+	setCodexStringIfEmpty(&item.Organization, tokenInfo.OrganizationID)
+	setCodexStringIfEmpty(&item.PlanType, tokenInfo.PlanType)
+
+	refreshedCredentials := h.openaiOAuthService.BuildAccountCredentials(tokenInfo)
+	item.Credentials = mergeCodexImportMap(item.Credentials, refreshedCredentials)
+	if item.IDToken != "" {
+		item.Credentials["id_token"] = item.IDToken
+	}
+	now := time.Now().UTC()
+	return finalizeCodexImportAccessToken(item, index, now)
+}
+
+func setCodexStringIfEmpty(target *string, value string) {
+	if target == nil {
+		return
+	}
+	value = strings.TrimSpace(value)
+	if strings.TrimSpace(*target) == "" && value != "" {
+		*target = value
+	}
 }
 
 func enrichCodexImportAccountFromJWT(item *codexImportAccount, token string, validateExpiry bool, now time.Time) error {
@@ -963,9 +1129,8 @@ func mergeCodexImportCredentials(existing, incoming map[string]any, item *codexI
 	if item == nil {
 		return out
 	}
-	if strings.TrimSpace(item.RefreshToken) == "" {
-		delete(out, "refresh_token")
-		delete(out, "client_id")
+	if strings.TrimSpace(item.RefreshToken) != "" && strings.TrimSpace(codexCredentialString(out, "client_id")) == "" {
+		out["client_id"] = openai.ClientID
 	}
 	if strings.TrimSpace(item.IDToken) == "" {
 		delete(out, "id_token")
