@@ -86,6 +86,18 @@ func (s *OpenAIGatewayService) recordOpenAIUpstreamRequestFailure(ctx context.Co
 	s.recordOpenAIUpstreamFailure(ctx, account, proxyURL, "request_error", err)
 }
 
+func (s *OpenAIGatewayService) recordOpenAIUpstreamStreamTimeout(ctx context.Context, account *Account, proxyURL string, model string, interval time.Duration) {
+	model = strings.TrimSpace(model)
+	message := "stream data interval timeout"
+	if interval > 0 {
+		message = fmt.Sprintf("%s after %s", message, interval)
+	}
+	if model != "" {
+		message = fmt.Sprintf("%s for model %s", message, model)
+	}
+	s.recordOpenAIUpstreamFailure(ctx, account, proxyURL, "stream_timeout", fmt.Errorf("%s", message))
+}
+
 func (s *OpenAIGatewayService) recordOpenAIUpstreamStatusFailure(ctx context.Context, account *Account, proxyURL string, statusCode int, upstreamMsg string, upstreamBody []byte) {
 	if !shouldRecordOpenAIUpstreamStatusFailure(statusCode, upstreamMsg, upstreamBody) {
 		return

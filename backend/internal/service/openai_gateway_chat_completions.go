@@ -280,7 +280,7 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	var result *OpenAIForwardResult
 	var handleErr error
 	if clientStream {
-		result, handleErr = s.handleChatStreamingResponse(resp, c, account, originalModel, billingModel, upstreamModel, includeUsage, startTime, len(body))
+		result, handleErr = s.handleChatStreamingResponse(resp, c, account, proxyURL, originalModel, billingModel, upstreamModel, includeUsage, startTime, len(body))
 	} else {
 		result, handleErr = s.handleChatBufferedStreamingResponse(resp, c, originalModel, billingModel, upstreamModel, startTime)
 	}
@@ -407,6 +407,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	resp *http.Response,
 	c *gin.Context,
 	account *Account,
+	proxyURL string,
 	originalModel string,
 	billingModel string,
 	upstreamModel string,
@@ -760,6 +761,9 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 			}
 			if clientDisconnected {
 				return resultWithUsage(), fmt.Errorf("stream usage incomplete after timeout")
+			}
+			if !clientOutputStarted {
+				s.recordOpenAIUpstreamStreamTimeout(context.Background(), account, proxyURL, originalModel, streamInterval)
 			}
 			logger.L().Warn("openai chat_completions stream: data interval timeout",
 				zap.String("request_id", requestID),

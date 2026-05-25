@@ -203,6 +203,26 @@ func TestOpenAIUpstreamStatusFailuresBlockAccountAndProxyAfterTwoFailures(t *tes
 	require.True(t, svc.isOpenAIProxyRuntimeBlocked(account))
 }
 
+func TestOpenAIUpstreamStreamTimeoutsBlockAccountAndProxyAfterTwoFailures(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	proxyID := int64(106)
+	account := &Account{
+		ID:       53,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17817},
+	}
+
+	svc.recordOpenAIUpstreamStreamTimeout(context.Background(), account, "socks5://host.docker.internal:17817", "gpt-5.5", 75*time.Second)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.False(t, svc.isOpenAIProxyRuntimeBlocked(account))
+
+	svc.recordOpenAIUpstreamStreamTimeout(context.Background(), account, "socks5://host.docker.internal:17817", "gpt-5.5", 75*time.Second)
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.True(t, svc.isOpenAIProxyRuntimeBlocked(account))
+}
+
 func TestOpenAIUpstreamNetworkSuccessClearsConsecutiveFailureCounters(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	proxyID := int64(104)

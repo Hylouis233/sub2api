@@ -215,6 +215,79 @@ func TestComputeRuleMetricNewIndicators(t *testing.T) {
 	}
 }
 
+func TestComputeRuleMetricSkipsRateAlertsBelowMinimumRequestCount(t *testing.T) {
+	t.Parallel()
+
+	start := time.Now().UTC().Add(-5 * time.Minute)
+	end := time.Now().UTC()
+	ctx := context.Background()
+
+	tests := []struct {
+		name       string
+		metricType string
+		overview   *OpsDashboardOverview
+		wantValue  float64
+		wantOK     bool
+	}{
+		{
+			name:       "error_rate below minimum request count",
+			metricType: "error_rate",
+			overview: &OpsDashboardOverview{
+				RequestCountSLA: 19,
+				ErrorRate:       0.5,
+			},
+			wantOK: false,
+		},
+		{
+			name:       "success_rate meets minimum request count",
+			metricType: "success_rate",
+			overview: &OpsDashboardOverview{
+				RequestCountSLA: 20,
+				SLA:             0.9,
+			},
+			wantValue: 90,
+			wantOK:    true,
+		},
+		{
+			name:       "upstream_error_rate accepts string minimum",
+			metricType: "upstream_error_rate",
+			overview: &OpsDashboardOverview{
+				RequestCountSLA:   25,
+				UpstreamErrorRate: 0.12,
+			},
+			wantValue: 12,
+			wantOK:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rule := &OpsAlertRule{
+				MetricType: tt.metricType,
+				Filters: map[string]any{
+					"min_request_count": 20,
+				},
+			}
+			if tt.metricType == "upstream_error_rate" {
+				rule.Filters["min_request_count"] = "20"
+			}
+			svc := &OpsAlertEvaluatorService{
+				opsRepo: &stubOpsRepo{overview: tt.overview},
+			}
+
+			gotValue, gotOK := svc.computeRuleMetric(ctx, rule, nil, start, end, "", nil)
+			require.Equal(t, tt.wantOK, gotOK)
+			if !tt.wantOK {
+				return
+			}
+			require.InDelta(t, tt.wantValue, gotValue, 0.0001)
+		})
+	}
+}
+
 func TestOpsIncidentWebhookSendsOnlyForP0P1(t *testing.T) {
 	t.Parallel()
 

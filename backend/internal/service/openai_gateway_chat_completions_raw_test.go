@@ -324,6 +324,7 @@ func TestHandleChatStreamingResponse_SilentRefusalReasoningSummaryExempt(t *test
 		resp,
 		c,
 		rawChatCompletionsTestAccount(),
+		"",
 		"gpt-5.5",
 		"gpt-5.5",
 		"gpt-5.5",
