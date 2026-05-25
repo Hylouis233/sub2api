@@ -83,26 +83,61 @@ func (s *OpenAIGatewayService) recordOpenAIUpstreamRequestSuccess(account *Accou
 }
 
 func (s *OpenAIGatewayService) recordOpenAIUpstreamRequestFailure(ctx context.Context, account *Account, proxyURL string, err error) {
+	s.recordOpenAIUpstreamFailure(ctx, account, proxyURL, "request_error", err)
+}
+
+func (s *OpenAIGatewayService) recordOpenAIUpstreamStatusFailure(ctx context.Context, account *Account, proxyURL string, statusCode int, upstreamMsg string, upstreamBody []byte) {
+	if !shouldRecordOpenAIUpstreamStatusFailure(statusCode, upstreamMsg, upstreamBody) {
+		return
+	}
+	message := fmt.Sprintf("upstream status %d", statusCode)
+	if upstreamMsg = strings.TrimSpace(upstreamMsg); upstreamMsg != "" {
+		message += ": " + upstreamMsg
+	}
+	s.recordOpenAIUpstreamFailure(ctx, account, proxyURL, "upstream_status_failover", fmt.Errorf("%s", message))
+}
+
+func shouldRecordOpenAIUpstreamStatusFailure(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
+	if statusCode >= http.StatusInternalServerError {
+		return true
+	}
+	return isOpenAITransientProcessingError(statusCode, upstreamMsg, upstreamBody)
+}
+
+func (s *OpenAIGatewayService) recordOpenAIUpstreamFailure(ctx context.Context, account *Account, proxyURL string, reason string, err error) {
 	if s == nil || account == nil || err == nil {
 		return
 	}
 	now := time.Now()
+	accountCount := 0
+	proxyCount := 0
+	accountBlocked := false
+	proxyBlocked := false
 	accountKey := s.openAIUpstreamAccountFailureKey(account.ID)
 	if accountKey != "" {
-		if count := s.noteOpenAIUpstreamFailure(&s.openaiAccountNetworkFailureCounts, accountKey); count >= 2 {
+		accountCount = s.noteOpenAIUpstreamFailure(&s.openaiAccountNetworkFailureCounts, accountKey)
+		if accountCount >= 2 {
 			s.BlockAccountScheduling(account, now.Add(openAIUpstreamNetworkFailureBlockCooldown), "upstream_network_failures")
+			accountBlocked = true
 		}
 	}
 	proxyKey := s.openAIUpstreamProxyFailureKey(account, proxyURL)
 	if proxyKey != "" {
-		if count := s.noteOpenAIUpstreamFailure(&s.openaiProxyNetworkFailureCounts, proxyKey); count >= 2 {
+		proxyCount = s.noteOpenAIUpstreamFailure(&s.openaiProxyNetworkFailureCounts, proxyKey)
+		if proxyCount >= 2 {
 			s.blockOpenAIProxyRuntime(proxyKey, now.Add(openAIUpstreamNetworkFailureBlockCooldown))
+			proxyBlocked = true
 		}
 	}
 	safeErr := sanitizeUpstreamErrorMessage(err.Error())
 	zap.L().Warn("openai upstream request failed",
 		zap.Int64("account_id", account.ID),
 		zap.String("proxy_key", proxyKey),
+		zap.String("failure_reason", strings.TrimSpace(reason)),
+		zap.Int("account_failure_count", accountCount),
+		zap.Int("proxy_failure_count", proxyCount),
+		zap.Bool("account_runtime_blocked", accountBlocked),
+		zap.Bool("proxy_runtime_blocked", proxyBlocked),
 		zap.String("error", safeErr),
 	)
 }

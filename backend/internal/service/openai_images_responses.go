@@ -1169,6 +1169,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 			Kind:               "request_error",
 			Message:            safeErr,
 		})
+		s.recordOpenAIUpstreamRequestFailure(upstreamCtx, account, proxyURL, err)
 		return nil, fmt.Errorf("upstream request failed: %s", safeErr)
 	}
 	if resp.StatusCode >= 400 {
@@ -1188,7 +1189,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 				Kind:               "failover",
 				Message:            upstreamMsg,
 			})
-			s.handleFailoverSideEffects(upstreamCtx, resp, account)
+			s.handleFailoverSideEffects(upstreamCtx, resp, account, proxyURL, respBody)
 			return nil, &UpstreamFailoverError{
 				StatusCode:             resp.StatusCode,
 				ResponseBody:           respBody,

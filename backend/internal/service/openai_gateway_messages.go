@@ -326,6 +326,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 				Message:            upstreamMsg,
 				Detail:             upstreamDetail,
 			})
+			s.recordOpenAIUpstreamStatusFailure(ctx, account, proxyURL, resp.StatusCode, upstreamMsg, respBody)
 			s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
 			return nil, &UpstreamFailoverError{
 				StatusCode:             resp.StatusCode,

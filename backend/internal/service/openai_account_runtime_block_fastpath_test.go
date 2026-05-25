@@ -182,6 +182,27 @@ func TestOpenAIUpstreamNetworkFailuresBlockAccountAndProxyAfterTwoFailures(t *te
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
+func TestOpenAIUpstreamStatusFailuresBlockAccountAndProxyAfterTwoFailures(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	proxyID := int64(105)
+	account := &Account{
+		ID:       52,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17816},
+	}
+	body := []byte(`{"error":{"message":"Service temporarily unavailable"}}`)
+
+	svc.recordOpenAIUpstreamStatusFailure(context.Background(), account, "socks5://host.docker.internal:17816", http.StatusServiceUnavailable, "Service temporarily unavailable", body)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.False(t, svc.isOpenAIProxyRuntimeBlocked(account))
+
+	svc.recordOpenAIUpstreamStatusFailure(context.Background(), account, "socks5://host.docker.internal:17816", http.StatusServiceUnavailable, "Service temporarily unavailable", body)
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.True(t, svc.isOpenAIProxyRuntimeBlocked(account))
+}
+
 func TestOpenAIUpstreamNetworkSuccessClearsConsecutiveFailureCounters(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	proxyID := int64(104)

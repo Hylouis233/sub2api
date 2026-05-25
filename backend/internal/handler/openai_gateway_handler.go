@@ -197,11 +197,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 
-	imageIntent := service.IsOpenAIImageGenerationHardIntent("/v1/responses", reqModel, body)
-	if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
+	imageHardIntent := service.IsOpenAIImageGenerationHardIntent("/v1/responses", reqModel, body)
+	if imageHardIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
 		h.errorResponse(c, http.StatusForbidden, "permission_error", service.ImageGenerationPermissionMessage())
 		return
 	}
+	imageIntent := service.GroupAllowsImageGeneration(apiKey.Group) && service.IsImageGenerationIntent("/v1/responses", reqModel, body)
 	var imageReleaseFunc func()
 	if imageIntent {
 		var imageAcquired bool

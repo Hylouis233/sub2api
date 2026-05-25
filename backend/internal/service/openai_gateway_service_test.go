@@ -1000,17 +1000,60 @@ func TestOpenAIStreamingTimeout(t *testing.T) {
 		Header:     http.Header{},
 	}
 
-	start := time.Now()
-	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1}, start, "model", "model")
+	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
 	_ = pw.Close()
 	_ = pr.Close()
 
-	if err == nil || !strings.Contains(err.Error(), "stream data interval timeout") {
-		t.Fatalf("expected stream timeout error, got %v", err)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Contains(t, string(failoverErr.ResponseBody), "did not produce first payload")
+	require.False(t, c.Writer.Written())
+	require.Empty(t, rec.Body.String())
+}
+
+func TestOpenAIStreamingFirstPayloadTimeoutBlocksAccountAndProxyAfterTwoFailures(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 1,
+			StreamKeepaliveInterval:   0,
+			MaxLineSize:               defaultMaxLineSize,
+		},
 	}
-	if !strings.Contains(rec.Body.String(), "\"type\":\"error\"") || !strings.Contains(rec.Body.String(), "stream_timeout") {
-		t.Fatalf("expected OpenAI-compatible error SSE event, got %q", rec.Body.String())
+	svc := &OpenAIGatewayService{cfg: cfg}
+	proxyID := int64(201)
+	account := &Account{
+		ID:       201,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17817},
 	}
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+		pr, pw := io.Pipe()
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       pr,
+			Header:     http.Header{},
+		}
+
+		_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
+		_ = pw.Close()
+		_ = pr.Close()
+		require.Error(t, err)
+		var failoverErr *UpstreamFailoverError
+		require.ErrorAs(t, err, &failoverErr)
+		require.False(t, c.Writer.Written())
+		require.Empty(t, rec.Body.String())
+	}
+
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.True(t, svc.isOpenAIProxyRuntimeBlocked(account))
 }
 
 func TestOpenAIStreamingContextCanceledReturnsIncompleteErrorWithoutInjectingErrorEvent(t *testing.T) {
@@ -1193,7 +1236,7 @@ func TestOpenAIStreamingPreambleOnlyMissingTerminalReturnsFailover(t *testing.T)
 	require.Empty(t, rec.Body.String())
 }
 
-func TestOpenAIStreamingPreambleKeepaliveUsesDownstreamIdle(t *testing.T) {
+func TestOpenAIStreamingPreambleKeepaliveDoesNotStartDownstreamBeforeOutput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{
 		Gateway: config.GatewayConfig{
@@ -1229,7 +1272,7 @@ func TestOpenAIStreamingPreambleKeepaliveUsesDownstreamIdle(t *testing.T) {
 	_ = pr.Close()
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	require.Contains(t, rec.Body.String(), ":\n\n")
+	require.NotContains(t, rec.Body.String(), ":\n\n")
 	require.Contains(t, rec.Body.String(), "response.completed")
 }
 
@@ -1413,6 +1456,40 @@ func TestOpenAIStreamingPassthroughResponseFailedBeforeOutputReturnsFailover(t *
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
 	require.Contains(t, string(failoverErr.ResponseBody), "upstream processing failed")
+	require.False(t, c.Writer.Written())
+	require.Empty(t, rec.Body.String())
+}
+
+func TestOpenAIStreamingPassthroughFirstPayloadTimeoutReturnsFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			StreamDataIntervalTimeout: 1,
+			MaxLineSize:               defaultMaxLineSize,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       pr,
+		Header:     http.Header{"X-Request-Id": []string{"rid-passthrough-timeout"}},
+	}
+
+	_, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI, Name: "acc"}, time.Now(), "model", "model")
+	_ = pw.Close()
+	_ = pr.Close()
+
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Contains(t, string(failoverErr.ResponseBody), "did not produce first payload")
 	require.False(t, c.Writer.Written())
 	require.Empty(t, rec.Body.String())
 }
