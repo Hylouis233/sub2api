@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -35,6 +36,7 @@ type OpsAlertEvaluatorService struct {
 	opsService   *OpsService
 	opsRepo      OpsRepository
 	emailService *EmailService
+	settingRepo  SettingRepository
 
 	redisClient *redis.Client
 	cfg         *config.Config
@@ -65,6 +67,7 @@ func NewOpsAlertEvaluatorService(
 	opsService *OpsService,
 	opsRepo OpsRepository,
 	emailService *EmailService,
+	settingRepo SettingRepository,
 	redisClient *redis.Client,
 	cfg *config.Config,
 ) *OpsAlertEvaluatorService {
@@ -72,6 +75,7 @@ func NewOpsAlertEvaluatorService(
 		opsService:   opsService,
 		opsRepo:      opsRepo,
 		emailService: emailService,
+		settingRepo:  settingRepo,
 		redisClient:  redisClient,
 		cfg:          cfg,
 		instanceID:   uuid.NewString(),
@@ -196,6 +200,7 @@ func (s *OpsAlertEvaluatorService) evaluateOnce(interval time.Duration) {
 	eventsCreated := 0
 	eventsResolved := 0
 	emailsSent := 0
+	webhooksSent := 0
 
 	now := time.Now().UTC()
 	safeEnd := now.Truncate(time.Minute)
@@ -292,6 +297,9 @@ func (s *OpsAlertEvaluatorService) evaluateOnce(interval time.Duration) {
 				if s.maybeSendAlertEmail(ctx, runtimeCfg, rule, created) {
 					emailsSent++
 				}
+				if s.maybeSendOpsIncidentWebhook(ctx, rule, created) {
+					webhooksSent++
+				}
 			}
 			continue
 		}
@@ -307,7 +315,7 @@ func (s *OpsAlertEvaluatorService) evaluateOnce(interval time.Duration) {
 		}
 	}
 
-	result := truncateString(fmt.Sprintf("rules=%d enabled=%d evaluated=%d created=%d resolved=%d emails_sent=%d", rulesTotal, rulesEnabled, rulesEvaluated, eventsCreated, eventsResolved, emailsSent), 2048)
+	result := truncateString(fmt.Sprintf("rules=%d enabled=%d evaluated=%d created=%d resolved=%d emails_sent=%d webhooks_sent=%d", rulesTotal, rulesEnabled, rulesEvaluated, eventsCreated, eventsResolved, emailsSent, webhooksSent), 2048)
 	s.recordHeartbeatSuccess(runAt, time.Since(startedAt), result)
 }
 
@@ -640,6 +648,93 @@ func buildOpsAlertDescription(rule *OpsAlertRule, value float64, windowMinutes i
 		windowMinutes,
 		strings.TrimSpace(scope),
 	)
+}
+
+func (s *OpsAlertEvaluatorService) maybeSendOpsIncidentWebhook(ctx context.Context, rule *OpsAlertRule, event *OpsAlertEvent) bool {
+	if s == nil || s.settingRepo == nil || rule == nil || event == nil {
+		return false
+	}
+	if !isP0OrP1Severity(event.Severity) && !isP0OrP1Severity(rule.Severity) {
+		return false
+	}
+
+	webhookURL, err := s.settingRepo.GetValue(ctx, SettingKeyOpsIncidentWebhookURL)
+	if err != nil {
+		if errors.Is(err, ErrSettingNotFound) {
+			return false
+		}
+		logger.LegacyPrintf("service.ops_alert_evaluator", "[OpsAlertEvaluator] load ops incident webhook setting failed: %v", err)
+		return false
+	}
+	webhookURL = strings.TrimSpace(webhookURL)
+	if webhookURL == "" {
+		return false
+	}
+
+	if err := sendFeishuTextWebhook(ctx, webhookURL, buildOpsIncidentWebhookText(rule, event)); err != nil {
+		logger.LegacyPrintf("service.ops_alert_evaluator", "[OpsAlertEvaluator] send ops incident webhook failed (event=%d): %v", event.ID, err)
+		return false
+	}
+	return true
+}
+
+func isP0OrP1Severity(severity string) bool {
+	switch strings.ToUpper(strings.TrimSpace(severity)) {
+	case "P0", "P1":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildOpsIncidentWebhookText(rule *OpsAlertRule, event *OpsAlertEvent) string {
+	severity := strings.TrimSpace(event.Severity)
+	if severity == "" && rule != nil {
+		severity = strings.TrimSpace(rule.Severity)
+	}
+	title := strings.TrimSpace(event.Title)
+	if title == "" && rule != nil {
+		title = strings.TrimSpace(rule.Name)
+	}
+
+	metricValue := "-"
+	if event.MetricValue != nil {
+		metricValue = fmt.Sprintf("%.2f", *event.MetricValue)
+	}
+	threshold := "-"
+	if event.ThresholdValue != nil {
+		threshold = fmt.Sprintf("%.2f", *event.ThresholdValue)
+	} else if rule != nil {
+		threshold = fmt.Sprintf("%.2f", rule.Threshold)
+	}
+
+	metricType := ""
+	operator := ""
+	if rule != nil {
+		metricType = strings.TrimSpace(rule.MetricType)
+		operator = strings.TrimSpace(rule.Operator)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Sub2API 运维事故告警\n")
+	fmt.Fprintf(&b, "级别: %s\n", severity)
+	fmt.Fprintf(&b, "事件: %s\n", title)
+	if metricType != "" || operator != "" {
+		fmt.Fprintf(&b, "指标: %s %s %s (当前 %s)\n", metricType, operator, threshold, metricValue)
+	}
+	if strings.TrimSpace(event.Description) != "" {
+		fmt.Fprintf(&b, "说明: %s\n", strings.TrimSpace(event.Description))
+	}
+	if !event.FiredAt.IsZero() {
+		fmt.Fprintf(&b, "触发时间: %s\n", event.FiredAt.UTC().Format(time.RFC3339))
+	}
+	if event.ID > 0 {
+		fmt.Fprintf(&b, "事件ID: %d\n", event.ID)
+	}
+	if rule != nil && rule.ID > 0 {
+		fmt.Fprintf(&b, "规则ID: %d", rule.ID)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func (s *OpsAlertEvaluatorService) maybeSendAlertEmail(ctx context.Context, runtimeCfg *OpsAlertRuntimeSettings, rule *OpsAlertRule, event *OpsAlertEvent) bool {

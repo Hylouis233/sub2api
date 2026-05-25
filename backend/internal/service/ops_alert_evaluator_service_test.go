@@ -4,6 +4,10 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -209,4 +213,52 @@ func TestComputeRuleMetricNewIndicators(t *testing.T) {
 			require.InDelta(t, tt.wantValue, gotValue, 0.0001)
 		})
 	}
+}
+
+func TestOpsIncidentWebhookSendsOnlyForP0P1(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	var got feishuTextWebhookPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	settings := newMockSettingRepo()
+	require.NoError(t, settings.Set(context.Background(), SettingKeyOpsIncidentWebhookURL, server.URL))
+	svc := &OpsAlertEvaluatorService{settingRepo: settings}
+
+	rule := &OpsAlertRule{
+		ID:         11,
+		Name:       "Low success rate",
+		Severity:   "P1",
+		MetricType: "success_rate",
+		Operator:   "<",
+		Threshold:  95,
+	}
+	event := &OpsAlertEvent{
+		ID:             22,
+		Severity:       "P1",
+		Title:          "P1: Low success rate",
+		Description:    "success_rate < 95.00",
+		MetricValue:    float64Ptr(90),
+		ThresholdValue: float64Ptr(95),
+		FiredAt:        time.Date(2026, 5, 25, 8, 0, 0, 0, time.UTC),
+	}
+
+	require.True(t, svc.maybeSendOpsIncidentWebhook(context.Background(), rule, event))
+	require.Equal(t, int32(1), calls.Load())
+	require.Equal(t, "text", got.MsgType)
+	require.Contains(t, got.Content.Text, "Sub2API 运维事故告警")
+	require.Contains(t, got.Content.Text, "级别: P1")
+	require.Contains(t, got.Content.Text, "事件ID: 22")
+
+	event.ID = 23
+	event.Severity = "P2"
+	rule.Severity = "P2"
+	require.False(t, svc.maybeSendOpsIncidentWebhook(context.Background(), rule, event))
+	require.Equal(t, int32(1), calls.Load())
 }

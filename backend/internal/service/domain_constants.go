@@ -320,6 +320,12 @@ const (
 	// SettingKeyOpsRuntimeLogConfig stores JSON config for runtime log settings.
 	SettingKeyOpsRuntimeLogConfig = "ops_runtime_log_config"
 
+	// SettingKeyAccountReplenishmentWebhookURL stores the Feishu bot webhook URL for low-account replenishment alerts.
+	SettingKeyAccountReplenishmentWebhookURL = "account_replenishment_webhook_url"
+
+	// SettingKeyOpsIncidentWebhookURL stores the Feishu bot webhook URL for P0/P1 ops incidents.
+	SettingKeyOpsIncidentWebhookURL = "ops_incident_webhook_url"
+
 	// =========================
 	// Channel Monitor (渠道监控)
 	// =========================
