@@ -223,6 +223,50 @@ func TestOpenAIUpstreamStreamTimeoutsBlockAccountAndProxyAfterTwoFailures(t *tes
 	require.True(t, svc.isOpenAIProxyRuntimeBlocked(account))
 }
 
+func TestOpenAIUpstreamSlowFirstTokensBlockAccountAndProxyAfterTwoSlowSuccesses(t *testing.T) {
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+	svc.cfg.Gateway.StreamDataIntervalTimeout = 60
+	proxyID := int64(107)
+	account := &Account{
+		ID:       54,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17818},
+	}
+	slowFirstTokenMs := 61_000
+
+	svc.recordOpenAIUpstreamFirstTokenLatency(context.Background(), account, "gpt-5.5", &slowFirstTokenMs)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.False(t, svc.isOpenAIProxyRuntimeBlocked(account))
+
+	svc.recordOpenAIUpstreamFirstTokenLatency(context.Background(), account, "gpt-5.5", &slowFirstTokenMs)
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.True(t, svc.isOpenAIProxyRuntimeBlocked(account))
+}
+
+func TestOpenAIUpstreamSlowFirstTokenCounterResetsAfterFastSuccess(t *testing.T) {
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+	svc.cfg.Gateway.StreamDataIntervalTimeout = 60
+	proxyID := int64(108)
+	account := &Account{
+		ID:       55,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "socks5", Host: "host.docker.internal", Port: 17819},
+	}
+	slowFirstTokenMs := 61_000
+	fastFirstTokenMs := 2_000
+
+	svc.recordOpenAIUpstreamFirstTokenLatency(context.Background(), account, "gpt-5.5", &slowFirstTokenMs)
+	svc.recordOpenAIUpstreamFirstTokenLatency(context.Background(), account, "gpt-5.5", &fastFirstTokenMs)
+	svc.recordOpenAIUpstreamFirstTokenLatency(context.Background(), account, "gpt-5.5", &slowFirstTokenMs)
+
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.False(t, svc.isOpenAIProxyRuntimeBlocked(account))
+}
+
 func TestOpenAIUpstreamNetworkSuccessClearsConsecutiveFailureCounters(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	proxyID := int64(104)

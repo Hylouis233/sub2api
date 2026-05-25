@@ -14,6 +14,7 @@ import (
 )
 
 const openAIUpstreamNetworkFailureBlockCooldown = openAIStopSchedulingBridgeCooldown
+const openAIUpstreamSlowFirstTokenDefaultThreshold = time.Minute
 
 type openAIConsecutiveFailureCounter struct {
 	mu    sync.Mutex
@@ -96,6 +97,80 @@ func (s *OpenAIGatewayService) recordOpenAIUpstreamStreamTimeout(ctx context.Con
 		message = fmt.Sprintf("%s for model %s", message, model)
 	}
 	s.recordOpenAIUpstreamFailure(ctx, account, proxyURL, "stream_timeout", fmt.Errorf("%s", message))
+}
+
+func (s *OpenAIGatewayService) RecordOpenAIAccountFirstTokenLatency(ctx context.Context, account *Account, model string, firstTokenMs *int) {
+	s.recordOpenAIUpstreamFirstTokenLatency(ctx, account, model, firstTokenMs)
+}
+
+func (s *OpenAIGatewayService) recordOpenAIUpstreamFirstTokenLatency(ctx context.Context, account *Account, model string, firstTokenMs *int) {
+	if s == nil || account == nil || firstTokenMs == nil || *firstTokenMs <= 0 {
+		return
+	}
+	threshold := s.openAIUpstreamSlowFirstTokenThreshold()
+	if threshold <= 0 {
+		return
+	}
+	ttft := time.Duration(*firstTokenMs) * time.Millisecond
+	accountKey := s.openAIUpstreamAccountFailureKey(account.ID)
+	proxyKey := s.openAIUpstreamProxyFailureKey(account, "")
+	if ttft < threshold {
+		s.clearOpenAIUpstreamFailureCounter(&s.openaiAccountSlowFirstTokenCounts, accountKey)
+		s.clearOpenAIUpstreamFailureCounter(&s.openaiProxySlowFirstTokenCounts, proxyKey)
+		return
+	}
+	s.recordOpenAIUpstreamSlowFirstToken(ctx, account, proxyKey, model, ttft, threshold)
+}
+
+func (s *OpenAIGatewayService) openAIUpstreamSlowFirstTokenThreshold() time.Duration {
+	if s == nil || s.cfg == nil {
+		return openAIUpstreamSlowFirstTokenDefaultThreshold
+	}
+	if s.cfg.Gateway.StreamDataIntervalTimeout < 0 {
+		return 0
+	}
+	if s.cfg.Gateway.StreamDataIntervalTimeout == 0 {
+		return 0
+	}
+	return time.Duration(s.cfg.Gateway.StreamDataIntervalTimeout) * time.Second
+}
+
+func (s *OpenAIGatewayService) recordOpenAIUpstreamSlowFirstToken(ctx context.Context, account *Account, proxyKey string, model string, ttft time.Duration, threshold time.Duration) {
+	if s == nil || account == nil {
+		return
+	}
+	now := time.Now()
+	accountCount := 0
+	proxyCount := 0
+	accountBlocked := false
+	proxyBlocked := false
+	accountKey := s.openAIUpstreamAccountFailureKey(account.ID)
+	if accountKey != "" {
+		accountCount = s.noteOpenAIUpstreamFailure(&s.openaiAccountSlowFirstTokenCounts, accountKey)
+		if accountCount >= 2 {
+			s.BlockAccountScheduling(account, now.Add(openAIUpstreamNetworkFailureBlockCooldown), "slow_first_token")
+			accountBlocked = true
+		}
+	}
+	if proxyKey != "" {
+		proxyCount = s.noteOpenAIUpstreamFailure(&s.openaiProxySlowFirstTokenCounts, proxyKey)
+		if proxyCount >= 2 {
+			s.blockOpenAIProxyRuntime(proxyKey, now.Add(openAIUpstreamNetworkFailureBlockCooldown))
+			proxyBlocked = true
+		}
+	}
+	model = strings.TrimSpace(model)
+	zap.L().Warn("openai upstream slow first token",
+		zap.Int64("account_id", account.ID),
+		zap.String("proxy_key", proxyKey),
+		zap.String("model", model),
+		zap.Duration("first_token", ttft),
+		zap.Duration("threshold", threshold),
+		zap.Int("account_slow_first_token_count", accountCount),
+		zap.Int("proxy_slow_first_token_count", proxyCount),
+		zap.Bool("account_runtime_blocked", accountBlocked),
+		zap.Bool("proxy_runtime_blocked", proxyBlocked),
+	)
 }
 
 func (s *OpenAIGatewayService) recordOpenAIUpstreamStatusFailure(ctx context.Context, account *Account, proxyURL string, statusCode int, upstreamMsg string, upstreamBody []byte) {

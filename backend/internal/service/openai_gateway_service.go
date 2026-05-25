@@ -358,6 +358,8 @@ type OpenAIGatewayService struct {
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountNetworkFailureCounts   sync.Map // key: int64(accountID), value: *openAIConsecutiveFailureCounter
 	openaiProxyNetworkFailureCounts     sync.Map // key: string(proxy key), value: *openAIConsecutiveFailureCounter
+	openaiAccountSlowFirstTokenCounts   sync.Map // key: int64(accountID), value: *openAIConsecutiveFailureCounter
+	openaiProxySlowFirstTokenCounts     sync.Map // key: string(proxy key), value: *openAIConsecutiveFailureCounter
 	openaiProxyRuntimeBlockUntil        sync.Map // key: string(proxy key), value: time.Time
 	openaiOAuth429WindowStartUnixNano   atomic.Int64
 	openaiOAuth429WindowCount           atomic.Int64
