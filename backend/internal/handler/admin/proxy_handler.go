@@ -62,9 +62,11 @@ const (
 
 // ImportProxySubscriptionRequest imports supported HTTP/SOCKS nodes from a subscription.
 type ImportProxySubscriptionRequest struct {
-	URL        string `json:"url"`
-	Content    string `json:"content"`
-	NamePrefix string `json:"name_prefix"`
+	URL             string `json:"url"`
+	Content         string `json:"content"`
+	NamePrefix      string `json:"name_prefix"`
+	ActivateNew     *bool  `json:"activate_new"`
+	QualityMinScore *int   `json:"quality_min_score"`
 }
 
 type importProxySubscriptionCandidate struct {
@@ -87,6 +89,7 @@ type importProxySubscriptionResult struct {
 	Total       int      `json:"total"`
 	Parsed      int      `json:"parsed"`
 	Created     int      `json:"created"`
+	Activated   int      `json:"activated"`
 	Skipped     int      `json:"skipped"`
 	Unsupported int      `json:"unsupported"`
 	Invalid     int      `json:"invalid"`
@@ -431,6 +434,11 @@ func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
 	req.URL = strings.TrimSpace(req.URL)
 	req.Content = strings.TrimSpace(req.Content)
 	req.NamePrefix = strings.TrimSpace(req.NamePrefix)
+	activateNew := req.ActivateNew == nil || *req.ActivateNew
+	qualityMinScore := 75
+	if req.QualityMinScore != nil {
+		qualityMinScore = *req.QualityMinScore
+	}
 	if req.URL == "" && req.Content == "" {
 		response.BadRequest(c, "url or content is required")
 		return
@@ -471,19 +479,37 @@ func (h *ProxyHandler) ImportSubscription(c *gin.Context) {
 				result.Skipped++
 				continue
 			}
-			if _, err := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
+			created, err := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
 				Name:     item.Name,
 				Protocol: item.Protocol,
 				Host:     item.Host,
 				Port:     item.Port,
 				Username: item.Username,
 				Password: item.Password,
-			}); err != nil {
+			})
+			if err != nil {
 				result.Failed++
 				result.Errors = append(result.Errors, item.Name+": "+err.Error())
 				continue
 			}
 			result.Created++
+			if activateNew {
+				quality, err := h.adminService.CheckProxyQuality(ctx, created.ID)
+				if err != nil {
+					_, _ = h.adminService.UpdateProxy(ctx, created.ID, &service.UpdateProxyInput{Status: service.StatusDisabled})
+					result.Errors = append(result.Errors, item.Name+": quality check failed: "+err.Error())
+					continue
+				}
+				if quality != nil && quality.Score >= qualityMinScore && quality.ChallengeCount == 0 && quality.FailedCount == 0 {
+					if _, err := h.adminService.UpdateProxy(ctx, created.ID, &service.UpdateProxyInput{Status: service.StatusActive}); err != nil {
+						result.Errors = append(result.Errors, item.Name+": activate failed: "+err.Error())
+						continue
+					}
+					result.Activated++
+				} else {
+					_, _ = h.adminService.UpdateProxy(ctx, created.ID, &service.UpdateProxyInput{Status: service.StatusDisabled})
+				}
+			}
 		}
 
 		return result, nil

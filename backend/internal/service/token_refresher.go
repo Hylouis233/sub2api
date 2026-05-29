@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"time"
 )
@@ -99,6 +100,9 @@ func (r *OpenAITokenRefresher) NeedsRefresh(account *Account, refreshWindow time
 	if strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
 		return false
 	}
+	if strings.TrimSpace(account.GetOpenAIAccessToken()) == "" {
+		return true
+	}
 	expiresAt := account.GetCredentialAsTime("expires_at")
 	if expiresAt == nil {
 		return account.IsRateLimited()
@@ -110,6 +114,12 @@ func (r *OpenAITokenRefresher) NeedsRefresh(account *Account, refreshWindow time
 // Refresh 执行token刷新
 // 保留原有credentials中的所有字段，只更新token相关字段
 func (r *OpenAITokenRefresher) Refresh(ctx context.Context, account *Account) (map[string]any, error) {
+	if account.ProxyID == nil {
+		if err := r.autoBindProxy(ctx, account); err != nil {
+			return nil, err
+		}
+	}
+
 	tokenInfo, err := r.openaiOAuthService.RefreshAccountToken(ctx, account)
 	if err != nil {
 		return nil, err
@@ -120,4 +130,30 @@ func (r *OpenAITokenRefresher) Refresh(ctx context.Context, account *Account) (m
 	newCredentials = MergeCredentials(account.Credentials, newCredentials)
 
 	return newCredentials, nil
+}
+
+func (r *OpenAITokenRefresher) autoBindProxy(ctx context.Context, account *Account) error {
+	if r.openaiOAuthService == nil || r.openaiOAuthService.proxyRepo == nil || r.accountRepo == nil || account == nil || account.ProxyID != nil {
+		return nil
+	}
+
+	proxies, err := r.openaiOAuthService.proxyRepo.ListActiveWithAccountCount(ctx)
+	if err != nil {
+		return err
+	}
+	if len(proxies) == 0 {
+		return nil
+	}
+
+	sort.Slice(proxies, func(i, j int) bool {
+		if proxies[i].AccountCount != proxies[j].AccountCount {
+			return proxies[i].AccountCount < proxies[j].AccountCount
+		}
+		return proxies[i].ID < proxies[j].ID
+	})
+
+	proxyID := proxies[0].ID
+	account.ProxyID = &proxyID
+	account.Proxy = nil
+	return r.accountRepo.Update(ctx, account)
 }

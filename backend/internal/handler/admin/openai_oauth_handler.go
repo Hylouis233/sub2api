@@ -32,8 +32,9 @@ func NewOpenAIOAuthHandler(openaiOAuthService *service.OpenAIOAuthService, admin
 
 // OpenAIGenerateAuthURLRequest represents the request for generating OpenAI auth URL
 type OpenAIGenerateAuthURLRequest struct {
-	ProxyID     *int64 `json:"proxy_id"`
-	RedirectURI string `json:"redirect_uri"`
+	ProxyID       *int64 `json:"proxy_id"`
+	AutoBindProxy *bool  `json:"auto_bind_proxy"`
+	RedirectURI   string `json:"redirect_uri"`
 }
 
 // GenerateAuthURL generates OpenAI OAuth authorization URL
@@ -45,9 +46,19 @@ func (h *OpenAIOAuthHandler) GenerateAuthURL(c *gin.Context) {
 		req = OpenAIGenerateAuthURLRequest{}
 	}
 
+	proxyID := req.ProxyID
+	if proxyID == nil && (req.AutoBindProxy == nil || *req.AutoBindProxy) {
+		if proxy, err := h.adminService.ResolveAutoProxy(c.Request.Context()); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		} else if proxy != nil {
+			proxyID = &proxy.ID
+		}
+	}
+
 	result, err := h.openaiOAuthService.GenerateAuthURL(
 		c.Request.Context(),
-		req.ProxyID,
+		proxyID,
 		req.RedirectURI,
 		oauthPlatformFromPath(c),
 	)
@@ -191,7 +202,8 @@ func (h *OpenAIOAuthHandler) RefreshAccountToken(c *gin.Context) {
 	}
 
 	updatedAccount, err := h.adminService.UpdateAccount(c.Request.Context(), accountID, &service.UpdateAccountInput{
-		Credentials: newCredentials,
+		Credentials:   newCredentials,
+		AutoBindProxy: true,
 	})
 	if err != nil {
 		response.ErrorFrom(c, err)
@@ -249,15 +261,16 @@ func (h *OpenAIOAuthHandler) CreateAccountFromOAuth(c *gin.Context) {
 
 	// Create account
 	account, err := h.adminService.CreateAccount(c.Request.Context(), &service.CreateAccountInput{
-		Name:        name,
-		Platform:    platform,
-		Type:        "oauth",
-		Credentials: credentials,
-		Extra:       nil,
-		ProxyID:     req.ProxyID,
-		Concurrency: req.Concurrency,
-		Priority:    req.Priority,
-		GroupIDs:    req.GroupIDs,
+		Name:          name,
+		Platform:      platform,
+		Type:          "oauth",
+		Credentials:   credentials,
+		Extra:         nil,
+		ProxyID:       req.ProxyID,
+		Concurrency:   req.Concurrency,
+		Priority:      req.Priority,
+		GroupIDs:      req.GroupIDs,
+		AutoBindProxy: true,
 	})
 	if err != nil {
 		response.ErrorFrom(c, err)

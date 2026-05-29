@@ -93,6 +93,7 @@ type AdminService interface {
 	ListProxiesWithAccountCount(ctx context.Context, page, pageSize int, protocol, status, search string, sortBy, sortOrder string) ([]ProxyWithAccountCount, int64, error)
 	GetAllProxies(ctx context.Context) ([]Proxy, error)
 	GetAllProxiesWithAccountCount(ctx context.Context) ([]ProxyWithAccountCount, error)
+	ResolveAutoProxy(ctx context.Context) (*Proxy, error)
 	GetProxy(ctx context.Context, id int64) (*Proxy, error)
 	GetProxiesByIDs(ctx context.Context, ids []int64) ([]Proxy, error)
 	CreateProxy(ctx context.Context, input *CreateProxyInput) (*Proxy, error)
@@ -2442,7 +2443,7 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	}
 
 	proxyID := input.ProxyID
-	if proxyID == nil && input.AutoBindProxy {
+	if proxyID == nil {
 		resolvedProxyID, err := s.resolveAutoProxyID(ctx)
 		if err != nil {
 			return nil, err
@@ -2941,6 +2942,14 @@ func (s *adminServiceImpl) GetAllProxiesWithAccountCount(ctx context.Context) ([
 	}
 	s.attachProxyLatency(ctx, proxies)
 	return proxies, nil
+}
+
+func (s *adminServiceImpl) ResolveAutoProxy(ctx context.Context) (*Proxy, error) {
+	proxyID, err := s.resolveAutoProxyID(ctx)
+	if err != nil || proxyID == nil {
+		return nil, err
+	}
+	return s.proxyRepo.GetByID(ctx, *proxyID)
 }
 
 func (s *adminServiceImpl) GetProxy(ctx context.Context, id int64) (*Proxy, error) {
