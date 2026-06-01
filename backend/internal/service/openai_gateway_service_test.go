@@ -35,6 +35,11 @@ type snapshotUpdateAccountRepo struct {
 	updateExtraCalls chan map[string]any
 }
 
+type recoverableOpenAIAccountRepo struct {
+	stubOpenAIAccountRepo
+	clearRateLimitCalls int
+}
+
 func (r *snapshotUpdateAccountRepo) UpdateExtra(ctx context.Context, id int64, updates map[string]any) error {
 	if r.updateExtraCalls != nil {
 		copied := make(map[string]any, len(updates))
@@ -44,6 +49,19 @@ func (r *snapshotUpdateAccountRepo) UpdateExtra(ctx context.Context, id int64, u
 		r.updateExtraCalls <- copied
 	}
 	return nil
+}
+
+func (r *recoverableOpenAIAccountRepo) ClearRateLimit(ctx context.Context, id int64) error {
+	r.clearRateLimitCalls++
+	for i := range r.accounts {
+		if r.accounts[i].ID == id {
+			r.accounts[i].RateLimitedAt = nil
+			r.accounts[i].RateLimitResetAt = nil
+			r.accounts[i].OverloadUntil = nil
+			return nil
+		}
+	}
+	return errors.New("account not found")
 }
 
 func (r stubOpenAIAccountRepo) GetByID(ctx context.Context, id int64) (*Account, error) {
@@ -77,6 +95,56 @@ func (r stubOpenAIAccountRepo) ListSchedulableByPlatform(ctx context.Context, pl
 
 func (r stubOpenAIAccountRepo) ListSchedulableUngroupedByPlatform(ctx context.Context, platform string) ([]Account, error) {
 	return r.ListSchedulableByPlatform(ctx, platform)
+}
+
+func (r stubOpenAIAccountRepo) ListByPlatform(ctx context.Context, platform string) ([]Account, error) {
+	var result []Account
+	for _, acc := range r.accounts {
+		if acc.Platform == platform && acc.Status == StatusActive {
+			result = append(result, acc)
+		}
+	}
+	return result, nil
+}
+
+func (r stubOpenAIAccountRepo) ListByGroup(ctx context.Context, groupID int64) ([]Account, error) {
+	var result []Account
+	for _, acc := range r.accounts {
+		if acc.Status != StatusActive {
+			continue
+		}
+		matched := len(acc.AccountGroups) == 0 && len(acc.GroupIDs) == 0
+		for _, ag := range acc.AccountGroups {
+			if ag.GroupID == groupID {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			for _, gid := range acc.GroupIDs {
+				if gid == groupID {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
+			result = append(result, acc)
+		}
+	}
+	return result, nil
+}
+
+func (r stubOpenAIAccountRepo) ClearRateLimit(ctx context.Context, id int64) error {
+	for i := range r.accounts {
+		if r.accounts[i].ID == id {
+			r.accounts[i].RateLimitedAt = nil
+			r.accounts[i].RateLimitResetAt = nil
+			r.accounts[i].OverloadUntil = nil
+			return nil
+		}
+	}
+	return errors.New("account not found")
 }
 
 type stubConcurrencyCache struct {
@@ -467,6 +535,110 @@ func TestOpenAISelectAccountWithLoadAwareness_FiltersUnschedulableWhenNoConcurre
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
+}
+
+func TestOpenAISelectAccountForModelWithExclusions_RecoversNonExhaustedCodexRateLimit(t *testing.T) {
+	now := time.Now()
+	rateLimitedAt := now.Add(-30 * time.Second)
+	resetAt := now.Add(5 * time.Hour)
+	account := Account{
+		ID:               9,
+		Platform:         PlatformOpenAI,
+		Type:             AccountTypeOAuth,
+		Status:           StatusActive,
+		Schedulable:      true,
+		Concurrency:      1,
+		Priority:         0,
+		RateLimitedAt:    &rateLimitedAt,
+		RateLimitResetAt: &resetAt,
+		Extra: map[string]any{
+			"codex_5h_used_percent":  31.0,
+			"codex_7d_used_percent":  42.0,
+			"codex_usage_updated_at": rateLimitedAt.Format(time.RFC3339),
+		},
+	}
+	repo := &recoverableOpenAIAccountRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}}}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	svc.BlockAccountScheduling(&account, resetAt, "429")
+
+	selected, err := svc.SelectAccountForModelWithExclusions(context.Background(), nil, "", "gpt-5.2", nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	require.Equal(t, account.ID, selected.ID)
+	require.Equal(t, 1, repo.clearRateLimitCalls)
+	require.Nil(t, selected.RateLimitResetAt)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(selected))
+}
+
+func TestOpenAISelectAccountWithLoadAwareness_RecoversNonExhaustedCodexRateLimit(t *testing.T) {
+	now := time.Now()
+	rateLimitedAt := now.Add(-30 * time.Second)
+	resetAt := now.Add(5 * time.Hour)
+	account := Account{
+		ID:               10,
+		Platform:         PlatformOpenAI,
+		Type:             AccountTypeOAuth,
+		Status:           StatusActive,
+		Schedulable:      true,
+		Concurrency:      1,
+		Priority:         0,
+		RateLimitedAt:    &rateLimitedAt,
+		RateLimitResetAt: &resetAt,
+		Extra: map[string]any{
+			"codex_5h_used_percent":  31.0,
+			"codex_7d_used_percent":  42.0,
+			"codex_usage_updated_at": rateLimitedAt.Format(time.RFC3339),
+		},
+	}
+	repo := &recoverableOpenAIAccountRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}}}
+	svc := &OpenAIGatewayService{
+		accountRepo:        repo,
+		concurrencyService: NewConcurrencyService(stubConcurrencyCache{}),
+	}
+
+	selection, err := svc.SelectAccountWithLoadAwareness(context.Background(), nil, "", "gpt-5.2", nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, account.ID, selection.Account.ID)
+	require.Equal(t, 1, repo.clearRateLimitCalls)
+	require.True(t, selection.Acquired)
+	require.Nil(t, selection.Account.RateLimitResetAt)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+func TestOpenAISelectAccountForModelWithExclusions_DoesNotRecoverExhaustedCodexRateLimit(t *testing.T) {
+	now := time.Now()
+	rateLimitedAt := now.Add(-30 * time.Second)
+	resetAt := now.Add(5 * time.Hour)
+	account := Account{
+		ID:               11,
+		Platform:         PlatformOpenAI,
+		Type:             AccountTypeOAuth,
+		Status:           StatusActive,
+		Schedulable:      true,
+		Concurrency:      1,
+		Priority:         0,
+		RateLimitedAt:    &rateLimitedAt,
+		RateLimitResetAt: &resetAt,
+		Extra: map[string]any{
+			"codex_5h_used_percent":  12.0,
+			"codex_7d_used_percent":  100.0,
+			"codex_usage_updated_at": rateLimitedAt.Format(time.RFC3339),
+		},
+	}
+	repo := &recoverableOpenAIAccountRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}}}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+
+	selected, err := svc.SelectAccountForModelWithExclusions(context.Background(), nil, "", "gpt-5.2", nil)
+
+	require.Error(t, err)
+	require.Nil(t, selected)
+	require.Equal(t, 0, repo.clearRateLimitCalls)
 }
 
 func TestOpenAISelectAccountForModelWithExclusions_StickyUnschedulableClearsSession(t *testing.T) {
