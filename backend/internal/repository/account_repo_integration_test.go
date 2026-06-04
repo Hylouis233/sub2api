@@ -707,6 +707,52 @@ func (s *AccountRepoSuite) TestClearRateLimit() {
 	s.Require().Nil(got.OverloadUntil)
 }
 
+func (s *AccountRepoSuite) TestListAccountsWithExpiredRuntimeBlocks() {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Minute)
+	future := now.Add(time.Minute)
+
+	rateLimited := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-expired-rate-limit", RateLimitResetAt: &past})
+	tempUnsched := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-expired-temp-unsched"})
+	futureRateLimited := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-future-rate-limit", RateLimitResetAt: &future})
+	errorStatus := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-error-expired", Status: service.StatusError, RateLimitResetAt: &past})
+	modelLimited := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name: "acc-expired-model-limit",
+		Extra: map[string]any{
+			"model_rate_limits": map[string]any{
+				"claude-sonnet-4-5": map[string]any{
+					"rate_limit_reset_at": past.Format(time.RFC3339),
+				},
+			},
+		},
+	})
+	futureModelLimited := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name: "acc-future-model-limit",
+		Extra: map[string]any{
+			"model_rate_limits": map[string]any{
+				"claude-opus-4-1": map[string]any{
+					"rate_limit_reset_at": future.Format(time.RFC3339),
+				},
+			},
+		},
+	})
+	s.Require().NoError(s.repo.SetTempUnschedulable(s.ctx, tempUnsched.ID, past, "expired"))
+
+	ids, err := s.repo.ListAccountsWithExpiredRuntimeBlocks(s.ctx, now, 100)
+	s.Require().NoError(err)
+
+	idSet := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		idSet[id] = true
+	}
+	s.Require().True(idSet[rateLimited.ID], "expired account rate limit should be returned")
+	s.Require().True(idSet[tempUnsched.ID], "expired temp unschedulable should be returned")
+	s.Require().True(idSet[modelLimited.ID], "expired model rate limit should be returned")
+	s.Require().False(idSet[futureRateLimited.ID], "future account rate limit should not be returned")
+	s.Require().False(idSet[futureModelLimited.ID], "future model rate limit should not be returned")
+	s.Require().False(idSet[errorStatus.ID], "error status account should not be auto-recovered")
+}
+
 func (s *AccountRepoSuite) TestTempUnschedulableFieldsLoadedByGetByIDAndGetByIDs() {
 	acc1 := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-temp-1"})
 	acc2 := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-temp-2"})

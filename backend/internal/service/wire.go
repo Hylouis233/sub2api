@@ -152,6 +152,13 @@ func ProvideAccountExpiryService(accountRepo AccountRepository) *AccountExpirySe
 	return svc
 }
 
+// ProvideAccountRuntimeRecoveryService creates and starts AccountRuntimeRecoveryService.
+func ProvideAccountRuntimeRecoveryService(accountRepo AccountRuntimeBlockRepository, rateLimitSvc *RateLimitService) *AccountRuntimeRecoveryService {
+	svc := NewAccountRuntimeRecoveryService(accountRepo, rateLimitSvc, time.Minute)
+	svc.Start()
+	return svc
+}
+
 // ProvideSubscriptionExpiryService creates and starts SubscriptionExpiryService.
 func ProvideSubscriptionExpiryService(userSubRepo UserSubscriptionRepository, settingRepo SettingRepository, notificationEmailService *NotificationEmailService) *SubscriptionExpiryService {
 	svc := NewSubscriptionExpiryService(userSubRepo, time.Minute)
@@ -503,6 +510,7 @@ var ProviderSet = wire.NewSet(
 	ProvideUpdateService,
 	ProvideTokenRefreshService,
 	ProvideAccountExpiryService,
+	ProvideAccountRuntimeRecoveryService,
 	ProvideSubscriptionExpiryService,
 	ProvideTimingWheelService,
 	ProvideDashboardAggregationService,

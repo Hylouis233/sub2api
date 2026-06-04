@@ -22,6 +22,8 @@ type rateLimitClearRepoStub struct {
 	clearAntigravityCalls     int
 	clearModelRateLimitCalls  int
 	clearTempUnschedCalls     int
+	listExpiredRuntimeIDs     []int64
+	listExpiredRuntimeCalls   int
 	clearErrorErr             error
 	clearRateLimitErr         error
 	clearAntigravityErr       error
@@ -60,6 +62,11 @@ func (r *rateLimitClearRepoStub) ClearModelRateLimits(ctx context.Context, id in
 func (r *rateLimitClearRepoStub) ClearTempUnschedulable(ctx context.Context, id int64) error {
 	r.clearTempUnschedCalls++
 	return r.clearTempUnschedulableErr
+}
+
+func (r *rateLimitClearRepoStub) ListAccountsWithExpiredRuntimeBlocks(ctx context.Context, now time.Time, limit int) ([]int64, error) {
+	r.listExpiredRuntimeCalls++
+	return r.listExpiredRuntimeIDs, nil
 }
 
 type tempUnschedCacheRecorder struct {
@@ -306,4 +313,89 @@ func TestRateLimitService_RecoverAccountState_InvalidatesOAuthTokenOnErrorRecove
 	require.Equal(t, 1, repo.clearErrorCalls)
 	require.Len(t, invalidator.accounts, 1)
 	require.Equal(t, int64(21), invalidator.accounts[0].ID)
+}
+
+func TestRateLimitService_RecoverExpiredRuntimeState_ClearsExpiredAccountRateLimit(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(-time.Second)
+	repo := &rateLimitClearRepoStub{
+		getByIDAccount: &Account{
+			ID:               42,
+			Status:           StatusActive,
+			Schedulable:      true,
+			RateLimitResetAt: &resetAt,
+		},
+	}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+
+	result, err := svc.RecoverExpiredRuntimeState(context.Background(), 42, now)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.ClearedRateLimit)
+	require.Equal(t, 1, repo.clearRateLimitCalls)
+	require.Equal(t, 1, repo.clearTempUnschedCalls)
+}
+
+func TestRateLimitService_RecoverExpiredRuntimeState_DoesNotClearFutureRateLimit(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(time.Minute)
+	repo := &rateLimitClearRepoStub{
+		getByIDAccount: &Account{
+			ID:               7,
+			Status:           StatusActive,
+			Schedulable:      true,
+			RateLimitResetAt: &resetAt,
+		},
+	}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+
+	result, err := svc.RecoverExpiredRuntimeState(context.Background(), 7, now)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.ClearedRateLimit)
+	require.Equal(t, 0, repo.clearRateLimitCalls)
+}
+
+func TestRateLimitService_RecoverExpiredRuntimeState_DoesNotClearErrorStatus(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(-time.Second)
+	repo := &rateLimitClearRepoStub{
+		getByIDAccount: &Account{
+			ID:               9,
+			Status:           StatusError,
+			RateLimitResetAt: &resetAt,
+		},
+	}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+
+	result, err := svc.RecoverExpiredRuntimeState(context.Background(), 9, now)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.ClearedRateLimit)
+	require.Equal(t, 0, repo.clearRateLimitCalls)
+}
+
+func TestRateLimitService_RecoverExpiredRuntimeState_ClearsExpiredModelRateLimit(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	repo := &rateLimitClearRepoStub{
+		getByIDAccount: &Account{
+			ID:          11,
+			Status:      StatusActive,
+			Schedulable: true,
+			Extra: map[string]any{
+				"model_rate_limits": map[string]any{
+					"claude-sonnet-4-5": map[string]any{
+						"rate_limit_reset_at": now.Add(-time.Second).Format(time.RFC3339),
+					},
+				},
+			},
+		},
+	}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+
+	result, err := svc.RecoverExpiredRuntimeState(context.Background(), 11, now)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.ClearedRateLimit)
+	require.Equal(t, 1, repo.clearModelRateLimitCalls)
 }

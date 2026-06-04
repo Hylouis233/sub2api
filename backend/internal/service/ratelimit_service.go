@@ -1513,6 +1513,20 @@ func (s *RateLimitService) RecoverAccountState(ctx context.Context, accountID in
 	return result, nil
 }
 
+func (s *RateLimitService) RecoverExpiredRuntimeState(ctx context.Context, accountID int64, now time.Time) (*SuccessfulTestRecoveryResult, error) {
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if account == nil || account.Status == StatusError || !hasExpiredRuntimeState(account, now) {
+		return &SuccessfulTestRecoveryResult{}, nil
+	}
+	if err := s.ClearRateLimit(ctx, accountID); err != nil {
+		return nil, err
+	}
+	return &SuccessfulTestRecoveryResult{ClearedRateLimit: true}, nil
+}
+
 // RecoverAccountAfterSuccessfulTest 将一次成功测试视为正常请求，
 // 按需恢复 error / rate-limit / overload / temp-unsched / model-rate-limit 等运行时状态。
 func (s *RateLimitService) RecoverAccountAfterSuccessfulTest(ctx context.Context, accountID int64) (*SuccessfulTestRecoveryResult, error) {
@@ -1548,6 +1562,46 @@ func hasRecoverableRuntimeState(account *Account) bool {
 	}
 	return hasNonEmptyMapValue(account.Extra, "model_rate_limits") ||
 		hasNonEmptyMapValue(account.Extra, "antigravity_quota_scopes")
+}
+
+func hasExpiredRuntimeState(account *Account, now time.Time) bool {
+	if account == nil {
+		return false
+	}
+	now = now.UTC()
+	if isDue(account.RateLimitResetAt, now) || isDue(account.OverloadUntil, now) || isDue(account.TempUnschedulableUntil, now) {
+		return true
+	}
+	return hasExpiredModelRateLimit(account.Extra, now)
+}
+
+func isDue(ts *time.Time, now time.Time) bool {
+	return ts != nil && !ts.After(now)
+}
+
+func hasExpiredModelRateLimit(extra map[string]any, now time.Time) bool {
+	rawLimits, ok := extra[modelRateLimitsKey].(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, rawLimit := range rawLimits {
+		limit, ok := rawLimit.(map[string]any)
+		if !ok {
+			continue
+		}
+		resetAtRaw, ok := limit["rate_limit_reset_at"].(string)
+		if !ok || strings.TrimSpace(resetAtRaw) == "" {
+			continue
+		}
+		resetAt, err := time.Parse(time.RFC3339, resetAtRaw)
+		if err != nil {
+			continue
+		}
+		if !resetAt.After(now) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasNonEmptyMapValue(extra map[string]any, key string) bool {

@@ -66,7 +66,7 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 
 // NewAccountRepository 创建账户仓储实例。
 // 这是对外暴露的构造函数，返回接口类型以便于依赖注入。
-func NewAccountRepository(client *dbent.Client, sqlDB *sql.DB, schedulerCache service.SchedulerCache) service.AccountRepository {
+func NewAccountRepository(client *dbent.Client, sqlDB *sql.DB, schedulerCache service.SchedulerCache) *accountRepository {
 	return newAccountRepositoryWithSQL(client, sqlDB, schedulerCache)
 }
 
@@ -1094,7 +1094,7 @@ func (r *accountRepository) SetModelRateLimit(ctx context.Context, id int64, sco
 	client := clientFromContext(ctx, r.client)
 	result, err := client.ExecContext(
 		ctx,
-		`UPDATE accounts SET 
+		`UPDATE accounts SET
 			extra = jsonb_set(
 				jsonb_set(COALESCE(extra, '{}'::jsonb), '{model_rate_limits}'::text[], COALESCE(extra->'model_rate_limits', '{}'::jsonb), true),
 				ARRAY['model_rate_limits', $1]::text[],
@@ -1122,6 +1122,48 @@ func (r *accountRepository) SetModelRateLimit(ctx context.Context, id int64, sco
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue model rate limit failed: account=%d err=%v", id, err)
 	}
 	return nil
+}
+
+func (r *accountRepository) ListAccountsWithExpiredRuntimeBlocks(ctx context.Context, now time.Time, limit int) ([]int64, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	client := clientFromContext(ctx, r.client)
+	rows, err := client.QueryContext(ctx, `
+		SELECT id
+		FROM accounts
+		WHERE deleted_at IS NULL
+			AND status = $1
+			AND schedulable = TRUE
+			AND (
+				(rate_limit_reset_at IS NOT NULL AND rate_limit_reset_at <= $2)
+				OR (temp_unschedulable_until IS NOT NULL AND temp_unschedulable_until <= $2)
+				OR EXISTS (
+					SELECT 1
+					FROM jsonb_each(COALESCE(extra->'model_rate_limits', '{}'::jsonb)) AS model_limit(scope, payload)
+					WHERE (payload->>'rate_limit_reset_at')::timestamptz <= $2
+				)
+			)
+		ORDER BY updated_at ASC, id ASC
+		LIMIT $3
+	`, service.StatusActive, now.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func (r *accountRepository) SetOverloaded(ctx context.Context, id int64, until time.Time) error {
